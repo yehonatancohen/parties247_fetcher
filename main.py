@@ -2,20 +2,16 @@
 Entry point for the GoOut Scraper VM service.
 
 Starts:
-  1. Telegram bot (async, in its own thread)
-  2. APScheduler daily scrape job
-  3. Flask API server (blocking, main thread)
+  1. APScheduler daily scrape job (background thread)
+  2. Telegram bot (runs in the main thread via run_polling)
 """
 
 import logging
-import threading
-from datetime import datetime
 
 import pymongo
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import config
-import api_server
 from orchestrator import run_daily_scrape
 from scraper import GoOutAccount
 from telegram_bot import TelegramManager
@@ -28,39 +24,31 @@ logger = logging.getLogger(__name__)
 
 
 def _build_accounts() -> list[GoOutAccount]:
-    accounts = []
-    for cfg in config.GOOUT_ACCOUNTS:
-        accounts.append(
-            GoOutAccount(
-                account_id=cfg["account_id"],
-                email=cfg["email"],
-                password=cfg["password"],
-                referral=cfg.get("referral", ""),
-            )
+    return [
+        GoOutAccount(
+            account_id=cfg["account_id"],
+            email=cfg["email"],
+            password=cfg["password"],
+            referral=cfg.get("referral", ""),
         )
-    return accounts
+        for cfg in config.GOOUT_ACCOUNTS
+    ]
 
 
 def main():
-    # MongoDB
     mongo_client = pymongo.MongoClient(config.MONGODB_URI)
-    db = mongo_client.get_default_database()
+    db = mongo_client[config.MONGODB_DB_NAME]
 
     accounts = _build_accounts()
     if not accounts:
         logger.error("No GoOut accounts configured — check GOOUT_ACCOUNT1_EMAIL etc.")
 
-    # Telegram manager
     telegram_mgr = TelegramManager(
         token=config.TELEGRAM_BOT_TOKEN,
         manager_chat_id=config.TELEGRAM_MANAGER_CHAT_ID,
         db=db,
     )
 
-    # Pass references into the API server module
-    api_server.init(accounts, db, telegram_mgr)
-
-    # APScheduler — daily scrape
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
         func=lambda: run_daily_scrape(accounts, db, telegram_mgr, force_send=False),
@@ -73,18 +61,13 @@ def main():
     scheduler.start()
     logger.info(f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC")
 
-    # Telegram bot runs in its own daemon thread
-    bot_thread = threading.Thread(
-        target=telegram_mgr.run_polling,
-        daemon=True,
-        name="telegram-bot",
+    # Wire /scrape command to trigger a manual scan
+    telegram_mgr.on_scrape_requested = lambda: run_daily_scrape(
+        accounts, db, telegram_mgr, force_send=True
     )
-    bot_thread.start()
-    logger.info("Telegram bot thread started")
 
-    # Flask API (blocking)
-    logger.info(f"Starting API server on port {config.API_PORT}")
-    api_server.run_server()
+    logger.info("Starting Telegram bot (polling)...")
+    telegram_mgr.run_polling()
 
 
 if __name__ == "__main__":

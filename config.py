@@ -10,8 +10,14 @@ MONGODB_URI: str = os.environ["MONGODB_URI"]
 # Backend URL for approve/reject/scrape-party API calls
 BACKEND_URL: str = os.environ["BACKEND_URL"].rstrip("/")
 
-# Shared secret for service-to-service auth (backend must have the same value)
+# Admin password for the backend (used to obtain a JWT for API calls)
+ADMIN_PASSWORD: str = os.environ["ADMIN_PASSWORD"]
+
+# Shared secret for scrape-party internal endpoint
 SERVICE_TOKEN: str = os.environ["SERVICE_TOKEN"]
+
+# MongoDB database name (required when URI has no default db in the path)
+MONGODB_DB_NAME: str = os.environ.get("MONGODB_DB_NAME", "parties247")
 
 # Go-Out account credentials
 GOOUT_ACCOUNTS: list[dict] = []

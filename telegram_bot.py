@@ -75,6 +75,13 @@ class TelegramManager:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def run_polling(self):
+        """Block the calling thread running the bot (use in main thread)."""
+        self._started = True
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._start_polling())
+
     def start_in_background(self):
         if self._started:
             return
@@ -623,14 +630,35 @@ class TelegramManager:
         return code
 
     # ------------------------------------------------------------------
-    # Backend HTTP calls (approve / reject / edit)
+    # Backend HTTP calls — auth via admin JWT
     # ------------------------------------------------------------------
+
+    def _get_admin_jwt(self) -> str | None:
+        """Log in to the backend and return a JWT token."""
+        try:
+            resp = http_requests.post(
+                f"{config.BACKEND_URL}/api/admin/login",
+                json={"password": config.ADMIN_PASSWORD},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("token")
+            logger.warning(f"Backend login returned {resp.status_code}")
+        except Exception as exc:
+            logger.error(f"Backend login failed: {exc}")
+        return None
+
+    def _auth_headers(self) -> dict:
+        token = self._get_admin_jwt()
+        if not token:
+            raise RuntimeError("Could not obtain admin JWT from backend.")
+        return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _call_backend_approve(self, pending_id: str) -> dict | None:
         try:
             resp = http_requests.post(
-                f"{config.BACKEND_URL}/api/internal/goout/approve/{pending_id}",
-                headers={"X-Service-Token": config.SERVICE_TOKEN},
+                f"{config.BACKEND_URL}/api/admin/goout/approve/{pending_id}",
+                headers=self._auth_headers(),
                 timeout=30,
             )
             if resp.status_code == 200:
@@ -643,8 +671,8 @@ class TelegramManager:
     def _call_backend_reject(self, pending_id: str) -> bool:
         try:
             resp = http_requests.post(
-                f"{config.BACKEND_URL}/api/internal/goout/reject/{pending_id}",
-                headers={"X-Service-Token": config.SERVICE_TOKEN},
+                f"{config.BACKEND_URL}/api/admin/goout/reject/{pending_id}",
+                headers=self._auth_headers(),
                 timeout=15,
             )
             return resp.status_code == 200
@@ -655,9 +683,9 @@ class TelegramManager:
     def _call_backend_edit_approve(self, pending_id: str, edits: dict) -> dict | None:
         try:
             resp = http_requests.post(
-                f"{config.BACKEND_URL}/api/internal/goout/edit-approve/{pending_id}",
+                f"{config.BACKEND_URL}/api/admin/goout/edit-approve/{pending_id}",
                 json={"edits": edits},
-                headers={"X-Service-Token": config.SERVICE_TOKEN},
+                headers=self._auth_headers(),
                 timeout=30,
             )
             if resp.status_code == 200:

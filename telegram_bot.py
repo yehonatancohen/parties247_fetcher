@@ -13,6 +13,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from typing import Callable
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 import requests as http_requests
 from telegram import (
@@ -656,13 +657,23 @@ class TelegramManager:
             raise RuntimeError("Could not obtain admin JWT from backend.")
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+    @staticmethod
+    def _append_ref(url: str, referral: str) -> str:
+        parsed = urlparse(url)
+        qs = parse_qsl(parsed.query, keep_blank_values=True)
+        if any(k.lower() == "ref" for k, _ in qs):
+            return url
+        qs.append(("ref", referral))
+        return urlunparse(parsed._replace(query=urlencode(qs)))
+
     def _call_backend_approve(self, pending_id: str, party_data: dict | None = None) -> dict | None:
         if not party_data:
             party_data = self._get_pending_party_data(pending_id)
+
+        # Resolve URL and referral — check party_data first, then the top-level pending doc
         url = party_data.get("canonicalUrl") or party_data.get("goOutUrl") or party_data.get("originalUrl")
         referral = party_data.get("referralCode")
         if not url:
-            # Fall back to top-level goOutUrl on the pending document itself
             try:
                 from bson.objectid import ObjectId
                 coll = self._pending_collection
@@ -676,22 +687,39 @@ class TelegramManager:
         if not url:
             logger.error(f"No URL found in pending doc {pending_id}")
             return None
-        payload: dict = {"url": url}
-        if referral:
-            payload["referralCode"] = referral
+
+        # Strip any existing ref param so canonicalUrl is clean
+        clean_url = url.split("?ref=")[0].split("&ref=")[0]
+
         try:
-            resp = http_requests.post(
+            headers = self._auth_headers()
+
+            # Step 1: add the party (backend scrapes full details)
+            r1 = http_requests.post(
                 f"{config.BACKEND_URL}/api/admin/add-party",
-                json=payload,
-                headers=self._auth_headers(),
+                json={"url": clean_url},
+                headers=headers,
                 timeout=60,
             )
-            if resp.status_code in (200, 201, 409):
-                self._mark_pending_approved(pending_id)
-                data = resp.json()
-                party_db_id = (data.get("party") or {}).get("_id") or data.get("id")
-                return {"party_db_id": party_db_id}
-            logger.warning(f"Backend approve returned {resp.status_code}: {resp.text[:200]}")
+            if r1.status_code not in (200, 201, 409):
+                logger.warning(f"Backend add-party returned {r1.status_code}: {r1.text[:200]}")
+                return None
+
+            d1 = r1.json()
+            party_db_id = (d1.get("party") or {}).get("_id") or d1.get("id")
+
+            # Step 2: apply the account-specific referral code
+            if party_db_id and referral:
+                goout_with_ref = self._append_ref(clean_url, referral)
+                http_requests.put(
+                    f"{config.BACKEND_URL}/api/admin/update-party/{party_db_id}",
+                    json={"referralCode": referral, "goOutUrl": goout_with_ref, "originalUrl": goout_with_ref},
+                    headers=headers,
+                    timeout=15,
+                )
+
+            self._mark_pending_approved(pending_id)
+            return {"party_db_id": party_db_id}
         except Exception as exc:
             logger.error(f"Failed to call backend approve: {exc}")
         return None

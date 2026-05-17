@@ -39,6 +39,7 @@ _tfa_requests: dict[str, asyncio.Event] = {}
 _tfa_codes: dict[str, str | None] = {}
 _edit_sessions: dict[int, str] = {}
 _carousel_selections: dict[str, list[str]] = {}
+_pending_approve_info: dict[str, dict] = {}  # pending_id -> {url, referral}
 
 
 class TelegramManager:
@@ -483,9 +484,22 @@ class TelegramManager:
         )
 
     async def _send_pending_party_message(self, pending_doc: dict):
-        party = pending_doc.get("party_data", {})
+        party = pending_doc.get("party_data", {}) or {}
         pending_id = str(pending_doc.get("_id", ""))
         account = pending_doc.get("account_id", "?")
+
+        # Cache URL + referral so approve never needs a DB round-trip
+        if pending_id:
+            cache_url = (
+                party.get("canonicalUrl")
+                or pending_doc.get("goOutUrl")
+                or party.get("goOutUrl")
+                or party.get("originalUrl")
+            )
+            _pending_approve_info[pending_id] = {
+                "url": cache_url,
+                "referral": party.get("referralCode"),
+            }
 
         name = party.get("name", "Unknown Party")
         date_str = party.get("date", "Unknown Date")
@@ -667,23 +681,29 @@ class TelegramManager:
         return urlunparse(parsed._replace(query=urlencode(qs)))
 
     def _call_backend_approve(self, pending_id: str, party_data: dict | None = None) -> dict | None:
-        if not party_data:
-            party_data = self._get_pending_party_data(pending_id)
+        # 1. In-memory cache (populated when the Telegram message was sent)
+        cached = _pending_approve_info.get(pending_id, {})
+        url = cached.get("url")
+        referral = cached.get("referral")
 
-        # Resolve URL and referral — check party_data first, then the top-level pending doc
-        url = party_data.get("canonicalUrl") or party_data.get("goOutUrl") or party_data.get("originalUrl")
-        referral = party_data.get("referralCode")
+        # 2. Passed party_data dict
+        if not url and party_data:
+            url = party_data.get("canonicalUrl") or party_data.get("goOutUrl") or party_data.get("originalUrl")
+            referral = referral or party_data.get("referralCode")
+
+        # 3. MongoDB fallback (full document lookup)
         if not url:
             try:
                 from bson.objectid import ObjectId
                 coll = self._pending_collection
                 doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
                 if doc:
-                    url = doc.get("goOutUrl")
-                    if not referral:
-                        referral = (doc.get("party_data") or {}).get("referralCode")
-            except Exception:
-                pass
+                    pd = doc.get("party_data") or {}
+                    url = pd.get("canonicalUrl") or doc.get("goOutUrl") or pd.get("goOutUrl") or pd.get("originalUrl")
+                    referral = referral or pd.get("referralCode")
+            except Exception as exc:
+                logger.error(f"MongoDB lookup failed for pending doc {pending_id}: {exc}")
+
         if not url:
             logger.error(f"No URL found in pending doc {pending_id}")
             return None
@@ -831,9 +851,16 @@ class TelegramManager:
         try:
             from bson.objectid import ObjectId
             coll = self._pending_collection
-            doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
-            return dict(doc.get("party_data", {})) if doc else {}
-        except Exception:
+            if coll is None:
+                logger.error("_get_pending_party_data: _pending_collection is None (db not set?)")
+                return {}
+            doc = coll.find_one({"_id": ObjectId(pending_id)})
+            if doc is None:
+                logger.warning(f"_get_pending_party_data: doc {pending_id} not found")
+                return {}
+            return dict(doc.get("party_data") or {})
+        except Exception as exc:
+            logger.error(f"_get_pending_party_data failed for {pending_id}: {exc}")
             return {}
 
     def _find_party_db_id(self, pending_id: str) -> str | None:

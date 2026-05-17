@@ -660,11 +660,23 @@ class TelegramManager:
         if not party_data:
             party_data = self._get_pending_party_data(pending_id)
         url = party_data.get("canonicalUrl") or party_data.get("goOutUrl") or party_data.get("originalUrl")
+        referral = party_data.get("referralCode")
+        if not url:
+            # Fall back to top-level goOutUrl on the pending document itself
+            try:
+                from bson.objectid import ObjectId
+                coll = self._pending_collection
+                doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+                if doc:
+                    url = doc.get("goOutUrl")
+                    if not referral:
+                        referral = (doc.get("party_data") or {}).get("referralCode")
+            except Exception:
+                pass
         if not url:
             logger.error(f"No URL found in pending doc {pending_id}")
             return None
         payload: dict = {"url": url}
-        referral = party_data.get("referralCode")
         if referral:
             payload["referralCode"] = referral
         try:

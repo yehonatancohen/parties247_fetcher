@@ -400,7 +400,7 @@ class TelegramManager:
                         try:
                             from bson.objectid import ObjectId
                             coll_c = self._carousels_collection
-                            cdoc = coll_c.find_one({"_id": ObjectId(cid)}, {"title": 1}) if coll_c else None
+                            cdoc = coll_c.find_one({"_id": ObjectId(cid)}, {"title": 1}) if coll_c is not None else None
                             added_to.append(cdoc.get("title", cid) if cdoc else cid)
                         except Exception:
                             added_to.append(cid)
@@ -696,7 +696,7 @@ class TelegramManager:
             try:
                 from bson.objectid import ObjectId
                 coll = self._pending_collection
-                doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+                doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll is not None else None
                 if doc:
                     pd = doc.get("party_data") or {}
                     url = pd.get("canonicalUrl") or doc.get("goOutUrl") or pd.get("goOutUrl") or pd.get("originalUrl")
@@ -747,7 +747,7 @@ class TelegramManager:
     def _mark_pending_approved(self, pending_id: str):
         from bson.objectid import ObjectId
         coll = self._pending_collection
-        if not coll or not pending_id:
+        if coll is None or not pending_id:
             return
         try:
             coll.update_one(
@@ -867,7 +867,7 @@ class TelegramManager:
         try:
             from bson.objectid import ObjectId
             coll = self._pending_collection
-            doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+            doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll is not None else None
             if not doc:
                 return None
             goout_url = doc.get("goOutUrl") or doc.get("party_data", {}).get("goOutUrl")

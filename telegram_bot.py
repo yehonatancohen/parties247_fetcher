@@ -296,7 +296,7 @@ class TelegramManager:
         if data.startswith("approve:"):
             pending_id = data.split(":", 1)[1]
             party_data = self._get_pending_party_data(pending_id)
-            result = self._call_backend_approve(pending_id)
+            result = self._call_backend_approve(pending_id, party_data)
             if result:
                 party_db_id = result.get("party_db_id")
                 msg_text = (query.message.caption or query.message.text or "")
@@ -656,19 +656,46 @@ class TelegramManager:
             raise RuntimeError("Could not obtain admin JWT from backend.")
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    def _call_backend_approve(self, pending_id: str) -> dict | None:
+    def _call_backend_approve(self, pending_id: str, party_data: dict | None = None) -> dict | None:
+        if not party_data:
+            party_data = self._get_pending_party_data(pending_id)
+        url = party_data.get("canonicalUrl") or party_data.get("goOutUrl") or party_data.get("originalUrl")
+        if not url:
+            logger.error(f"No URL found in pending doc {pending_id}")
+            return None
+        payload: dict = {"url": url}
+        referral = party_data.get("referralCode")
+        if referral:
+            payload["referralCode"] = referral
         try:
             resp = http_requests.post(
-                f"{config.BACKEND_URL}/api/admin/goout/approve/{pending_id}",
+                f"{config.BACKEND_URL}/api/admin/add-party",
+                json=payload,
                 headers=self._auth_headers(),
-                timeout=30,
+                timeout=60,
             )
-            if resp.status_code == 200:
-                return resp.json()
+            if resp.status_code in (200, 201, 409):
+                self._mark_pending_approved(pending_id)
+                data = resp.json()
+                party_db_id = (data.get("party") or {}).get("_id") or data.get("id")
+                return {"party_db_id": party_db_id}
             logger.warning(f"Backend approve returned {resp.status_code}: {resp.text[:200]}")
         except Exception as exc:
             logger.error(f"Failed to call backend approve: {exc}")
         return None
+
+    def _mark_pending_approved(self, pending_id: str):
+        from bson.objectid import ObjectId
+        coll = self._pending_collection
+        if not coll or not pending_id:
+            return
+        try:
+            coll.update_one(
+                {"_id": ObjectId(pending_id)},
+                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
+            )
+        except Exception:
+            pass
 
     def _call_backend_reject(self, pending_id: str) -> bool:
         try:

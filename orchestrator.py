@@ -10,7 +10,7 @@ Writes directly to MongoDB for:
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests as http_requests
 
@@ -166,3 +166,61 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
     except Exception:
         if telegram_mgr:
             telegram_mgr.send_message_sync(summary)
+
+
+def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
+    """Add account1's upcoming parties (within 7 days) to the 'hot now' carousel."""
+    if db is None:
+        logger.warning("[HOT-NOW] No database — skipping")
+        return
+
+    account1 = next((a for a in accounts if a.account_id == "account1"), None)
+    if not account1:
+        logger.warning("[HOT-NOW] No account1 found in accounts list")
+        return
+
+    try:
+        carousel = db.carousels.find_one({"title": {"$regex": r"hot.?now", "$options": "i"}})
+    except Exception as exc:
+        logger.error(f"[HOT-NOW] Failed to find hot-now carousel: {exc}")
+        return
+
+    if not carousel:
+        logger.warning("[HOT-NOW] No 'hot now' carousel found in DB")
+        return
+
+    carousel_id = carousel["_id"]
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=7)
+    today_str = now.strftime("%Y-%m-%d")
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    try:
+        all_parties = list(db.parties.find({"referralCode": account1.referral}, {"_id": 1, "date": 1}))
+    except Exception as exc:
+        logger.error(f"[HOT-NOW] Failed to fetch account1 parties: {exc}")
+        return
+
+    added = 0
+    for party in all_parties:
+        raw_date = party.get("date")
+        if not raw_date:
+            continue
+        if isinstance(raw_date, datetime):
+            date_str = raw_date.strftime("%Y-%m-%d")
+        else:
+            date_str = str(raw_date)[:10]
+        if today_str <= date_str <= cutoff_str:
+            try:
+                result = db.carousels.update_one(
+                    {"_id": carousel_id},
+                    {"$addToSet": {"partyIds": party["_id"]}},
+                )
+                if result.modified_count:
+                    added += 1
+            except Exception as exc:
+                logger.warning(f"[HOT-NOW] Failed to add party {party['_id']}: {exc}")
+
+    logger.info(f"[HOT-NOW] Added {added} new account1 parties to 'Hot Now' carousel")
+    if added and telegram_mgr:
+        telegram_mgr.send_message_sync(f"🔥 *Hot Now* updated: {added} upcoming account1 parties added.")

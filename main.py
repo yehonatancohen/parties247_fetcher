@@ -12,7 +12,7 @@ import pymongo
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import config
-from orchestrator import run_daily_scrape
+from orchestrator import run_daily_scrape, run_hot_now_update
 from scraper import GoOutAccount
 from telegram_bot import TelegramManager
 
@@ -66,8 +66,16 @@ def main():
         id="daily_goout_scrape",
         replace_existing=True,
     )
+    scheduler.add_job(
+        func=lambda: run_hot_now_update(accounts, db, telegram_mgr),
+        trigger="cron",
+        hour=config.GOOUT_SCRAPE_HOUR,
+        minute=30,
+        id="daily_hot_now",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info(f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC")
+    logger.info(f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC, hot-now at {config.GOOUT_SCRAPE_HOUR:02d}:30 UTC")
 
     # Wire /scrape command to trigger a manual scan
     telegram_mgr.on_scrape_requested = lambda: run_daily_scrape(

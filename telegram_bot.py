@@ -235,10 +235,24 @@ class TelegramManager:
             await update.message.reply_text("✅ No pending parties to approve.")
             return
         approved = 0
+        carousels = self._get_all_carousels()
         for doc in docs:
-            result = self._call_backend_approve(str(doc["_id"]))
+            pending_id = str(doc["_id"])
+            result = self._call_backend_approve(pending_id)
             if result:
                 approved += 1
+                party_db_id = result.get("party_db_id")
+                if party_db_id:
+                    selections = _carousel_selections.pop(pending_id, None)
+                    if selections is None:
+                        party_data_tmp = doc.get("party_data", {}) or {}
+                        selections = self._suggest_carousels(party_data_tmp, carousels)
+                        hot_now_id = self._hot_now_carousel_id(carousels)
+                        if hot_now_id and self._is_account1(doc.get("account_id", "")) and self._is_within_days(party_data_tmp.get("date"), 7):
+                            if hot_now_id not in selections:
+                                selections.append(hot_now_id)
+                    for cid in selections:
+                        self._add_party_to_carousel(cid, party_db_id)
         await update.message.reply_text(f"✅ Approved {approved}/{len(docs)} parties.")
 
     async def _cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,8 +315,18 @@ class TelegramManager:
             result = self._call_backend_approve(pending_id, party_data)
             if result:
                 party_db_id = result.get("party_db_id")
+                # Apply pre-selected carousels automatically
+                applied_names = []
+                if party_db_id:
+                    selections = _carousel_selections.pop(pending_id, [])
+                    carousels = self._get_all_carousels()
+                    for cid in selections:
+                        if self._add_party_to_carousel(cid, party_db_id):
+                            applied_names += self._carousel_names_for_ids(carousels, [cid])
                 msg_text = (query.message.caption or query.message.text or "")
                 suffix = "\n\n✅ *APPROVED*"
+                if applied_names:
+                    suffix += f"\n🎪 Added to: {', '.join(applied_names)}"
                 try:
                     if query.message.photo:
                         await query.edit_message_caption(msg_text + suffix, parse_mode="Markdown")
@@ -310,7 +334,6 @@ class TelegramManager:
                         await query.edit_message_text(msg_text + suffix, parse_mode="Markdown")
                 except Exception:
                     pass
-                await self._send_carousel_selection(pending_id, party_data, party_db_id)
             else:
                 try:
                     await query.edit_message_text(
@@ -374,6 +397,24 @@ class TelegramManager:
                     _tfa_codes[key] = None
                     _tfa_requests[key].set()
 
+        elif data.startswith("cshow:"):
+            pending_id = data.split(":", 1)[1]
+            carousels = self._get_all_carousels()
+            if not carousels:
+                await query.answer("No carousels configured.", show_alert=True)
+                return
+            if pending_id not in _carousel_selections:
+                party_data_tmp = self._get_pending_party_data(pending_id)
+                _carousel_selections[pending_id] = self._suggest_carousels(party_data_tmp, carousels)
+            selections = _carousel_selections[pending_id]
+            keyboard = self._build_carousel_keyboard(pending_id, carousels, selections)
+            await self._app.bot.send_message(
+                chat_id=self.manager_chat_id,
+                text="🎪 *Select carousels* _(tap to toggle, then Done)_",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+
         elif data.startswith("ctoggle:"):
             _, pending_id, carousel_id = data.split(":", 2)
             selections = _carousel_selections.get(pending_id, [])
@@ -391,23 +432,25 @@ class TelegramManager:
 
         elif data.startswith("cdone:"):
             _, pending_id = data.split(":", 1)
-            selections = _carousel_selections.pop(pending_id, [])
+            selections = _carousel_selections.get(pending_id, [])
             party_db_id = self._find_party_db_id(pending_id)
-            added_to = []
-            if party_db_id and selections:
+            if party_db_id:
+                # Party already in DB — apply carousels now
+                _carousel_selections.pop(pending_id, None)
+                carousels = self._get_all_carousels()
+                added_to = []
                 for cid in selections:
                     if self._add_party_to_carousel(cid, party_db_id):
-                        try:
-                            from bson.objectid import ObjectId
-                            coll_c = self._carousels_collection
-                            cdoc = coll_c.find_one({"_id": ObjectId(cid)}, {"title": 1}) if coll_c is not None else None
-                            added_to.append(cdoc.get("title", cid) if cdoc else cid)
-                        except Exception:
-                            added_to.append(cid)
-            if added_to:
-                await query.edit_message_text(f"✅ Added to: {', '.join(added_to)}", parse_mode="Markdown")
+                        added_to += self._carousel_names_for_ids(carousels, [cid])
+                if added_to:
+                    await query.edit_message_text(f"✅ Added to: {', '.join(added_to)}")
+                else:
+                    await query.edit_message_text("✅ Saved (no carousels selected).")
             else:
-                await query.edit_message_text("✅ Saved (no carousels selected).")
+                # Pre-approval — just save the selection
+                await query.edit_message_text(
+                    f"✅ {len(selections)} carousel(s) saved — will be applied on approve."
+                )
 
         elif data.startswith("cskip:"):
             _carousel_selections.pop(data.split(":", 1)[1], None)
@@ -501,6 +544,20 @@ class TelegramManager:
                 "referral": party.get("referralCode"),
             }
 
+        # Pre-compute and cache carousel suggestions
+        carousel_names = []
+        if pending_id:
+            carousels = self._get_all_carousels()
+            suggested_ids = self._suggest_carousels(party, carousels) if carousels else []
+            # Auto-include "hot now" for account1 parties within the next 7 days
+            if carousels:
+                hot_now_id = self._hot_now_carousel_id(carousels)
+                if hot_now_id and self._is_account1(account) and self._is_within_days(party.get("date"), 7):
+                    if hot_now_id not in suggested_ids:
+                        suggested_ids.append(hot_now_id)
+            _carousel_selections[pending_id] = suggested_ids
+            carousel_names = self._carousel_names_for_ids(carousels, suggested_ids)
+
         name = party.get("name", "Unknown Party")
         date_str = party.get("date", "Unknown Date")
         location = party.get("location", "Unknown Location")
@@ -513,6 +570,13 @@ class TelegramManager:
             f"💰 ₪{price:.0f}" if price else "💰 Free / Unknown"
         )
 
+        carousel_line = ""
+        if carousel_names:
+            escaped_names = ", ".join(self._escape_md(n) for n in carousel_names)
+            carousel_line = f"\n🎪 _{escaped_names}_"
+        else:
+            carousel_line = "\n🎪 _No carousels auto-selected_"
+
         text = (
             f"🎉 *New Party Found!*\n"
             f"Account: {account}\n\n"
@@ -521,13 +585,19 @@ class TelegramManager:
             f"📍 {self._escape_md(str(location))}\n"
             f"{price_text}\n"
             f"🔗 [Go-Out Link]({url})"
+            f"{carousel_line}"
         )
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pending_id}"),
-            InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{pending_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pending_id}"),
-        ]])
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pending_id}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{pending_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pending_id}"),
+            ],
+            [
+                InlineKeyboardButton("🎪 Edit Carousels", callback_data=f"cshow:{pending_id}"),
+            ],
+        ])
 
         try:
             if image_url:
@@ -846,6 +916,37 @@ class TelegramManager:
         except Exception as exc:
             logger.error(f"Failed to add party to carousel: {exc}")
             return False
+
+    @staticmethod
+    def _hot_now_carousel_id(carousels: list) -> str | None:
+        for c in carousels:
+            title = (c.get("title") or "").lower()
+            if "hot" in title and "now" in title:
+                return str(c["_id"])
+        return None
+
+    @staticmethod
+    def _is_account1(account_id: str) -> bool:
+        return "account1" in (account_id or "").lower()
+
+    @staticmethod
+    def _is_within_days(date_val, days: int) -> bool:
+        if not date_val:
+            return False
+        try:
+            if isinstance(date_val, datetime):
+                party_date = date_val.date()
+            else:
+                party_date = datetime.fromisoformat(str(date_val)[:10]).date()
+            today = datetime.now().date()
+            delta = (party_date - today).days
+            return 0 <= delta <= days
+        except Exception:
+            return False
+
+    def _carousel_names_for_ids(self, carousels: list, ids: list[str]) -> list[str]:
+        id_set = set(ids)
+        return [c.get("title", str(c["_id"])) for c in carousels if str(c["_id"]) in id_set]
 
     def _get_pending_party_data(self, pending_id: str) -> dict:
         try:

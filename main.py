@@ -39,6 +39,14 @@ def main():
     mongo_client = pymongo.MongoClient(config.MONGODB_URI)
     db = mongo_client[config.MONGODB_DB_NAME]
 
+    # Quick connectivity check
+    try:
+        mongo_client.admin.command("ping")
+        logger.info(f"Connected to MongoDB at {config.MONGODB_URI.split('@')[-1]}")
+    except Exception as exc:
+        logger.error(f"Could not connect to MongoDB: {exc}")
+        # We continue anyway as the app might recover, or fail later with better context
+
     accounts = _build_accounts()
     if not accounts:
         logger.error("No GoOut accounts configured — check GOOUT_ACCOUNT1_EMAIL etc.")

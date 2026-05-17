@@ -125,8 +125,7 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                             "goOutUrl": canonical,
                         }
 
-                        if not force_send:
-                            pending_coll.insert_one(pending_doc)
+                        pending_coll.insert_one(pending_doc)
 
                         if telegram_mgr:
                             telegram_mgr.send_party_for_approval_sync(pending_doc)

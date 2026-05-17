@@ -193,10 +193,12 @@ class TelegramManager:
             return
         await update.message.reply_text("🔄 Triggering manual scan...")
         if self.on_scrape_requested:
-            try:
-                self.on_scrape_requested()
-            except Exception as exc:
-                await update.message.reply_text(f"❌ Scrape failed: {exc}")
+            def _run():
+                try:
+                    self.on_scrape_requested()
+                except Exception as exc:
+                    self.send_message_sync(f"❌ Scrape failed: {exc}")
+            threading.Thread(target=_run, daemon=True).start()
 
     async def _cmd_pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_manager(update):

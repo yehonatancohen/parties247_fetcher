@@ -180,7 +180,7 @@ def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
         return
 
     try:
-        carousel = db.carousels.find_one({"title": {"$regex": r"hot.?now", "$options": "i"}})
+        carousel = db.carousels.find_one({"title": {"$regex": "חם עכשיו"}})
     except Exception as exc:
         logger.error(f"[HOT-NOW] Failed to find hot-now carousel: {exc}")
         return

@@ -920,8 +920,8 @@ class TelegramManager:
     @staticmethod
     def _hot_now_carousel_id(carousels: list) -> str | None:
         for c in carousels:
-            title = (c.get("title") or "").lower()
-            if "hot" in title and "now" in title:
+            title = c.get("title") or ""
+            if "חם עכשיו" in title:
                 return str(c["_id"])
         return None
 

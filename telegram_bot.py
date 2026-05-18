@@ -66,10 +66,6 @@ class TelegramManager:
         return self._db.goout_sessions if self._db is not None else None
 
     @property
-    def _carousels_collection(self):
-        return self._db.carousels if self._db is not None else None
-
-    @property
     def _parties_collection(self):
         return self._db.parties if self._db is not None else None
 
@@ -858,19 +854,22 @@ class TelegramManager:
         return None
 
     # ------------------------------------------------------------------
-    # Carousel helpers (direct DB access)
+    # Carousel helpers (via backend API)
     # ------------------------------------------------------------------
 
     def _get_all_carousels(self) -> list:
-        coll = self._carousels_collection
-        if coll is None:
-            logger.warning("_get_all_carousels: DB collection is None")
-            return []
         try:
-            return list(coll.find({}).sort("order", 1))
+            resp = http_requests.get(f"{config.BACKEND_URL}/api/carousels", timeout=10)
+            if resp.status_code == 200:
+                carousels = resp.json()
+                for c in carousels:
+                    if "id" in c and "_id" not in c:
+                        c["_id"] = c["id"]
+                return carousels
+            logger.warning(f"_get_all_carousels: backend returned {resp.status_code}")
         except Exception as exc:
             logger.error(f"_get_all_carousels failed: {exc}")
-            return []
+        return []
 
     def _suggest_carousels(self, party_data: dict, carousels: list) -> list[str]:
         tags = {t.lower() for t in party_data.get("tags", [])}
@@ -908,19 +907,28 @@ class TelegramManager:
         return InlineKeyboardMarkup(rows)
 
     def _add_party_to_carousel(self, carousel_id: str, party_id: str) -> bool:
-        from bson.objectid import ObjectId
-        coll = self._carousels_collection
-        if coll is None:
-            return False
         try:
-            result = coll.update_one(
-                {"_id": ObjectId(carousel_id)},
-                {"$addToSet": {"partyIds": ObjectId(party_id)}},
+            headers = self._auth_headers()
+            carousels = self._get_all_carousels()
+            carousel = next((c for c in carousels if str(c.get("_id")) == carousel_id), None)
+            if carousel is None:
+                logger.warning(f"_add_party_to_carousel: carousel {carousel_id} not found")
+                return False
+            current_ids = [str(pid) for pid in carousel.get("partyIds", [])]
+            if party_id in current_ids:
+                return True
+            resp = http_requests.put(
+                f"{config.BACKEND_URL}/api/admin/carousels/{carousel_id}/parties",
+                json={"partyIds": current_ids + [party_id]},
+                headers=headers,
+                timeout=15,
             )
-            return result.matched_count > 0
+            if resp.status_code == 200:
+                return True
+            logger.warning(f"_add_party_to_carousel: backend returned {resp.status_code}: {resp.text[:200]}")
         except Exception as exc:
             logger.error(f"Failed to add party to carousel: {exc}")
-            return False
+        return False
 
     @staticmethod
     def _hot_now_carousel_id(carousels: list) -> str | None:

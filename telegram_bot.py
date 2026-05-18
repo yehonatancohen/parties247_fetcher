@@ -401,7 +401,10 @@ class TelegramManager:
             pending_id = data.split(":", 1)[1]
             carousels = self._get_all_carousels()
             if not carousels:
-                await query.answer("No carousels configured.", show_alert=True)
+                await self._app.bot.send_message(
+                    chat_id=self.manager_chat_id,
+                    text="⚠️ No carousels found in DB (check DB connection).",
+                )
                 return
             if pending_id not in _carousel_selections:
                 party_data_tmp = self._get_pending_party_data(pending_id)
@@ -861,10 +864,12 @@ class TelegramManager:
     def _get_all_carousels(self) -> list:
         coll = self._carousels_collection
         if coll is None:
+            logger.warning("_get_all_carousels: DB collection is None")
             return []
         try:
             return list(coll.find({}).sort("order", 1))
-        except Exception:
+        except Exception as exc:
+            logger.error(f"_get_all_carousels failed: {exc}")
             return []
 
     def _suggest_carousels(self, party_data: dict, carousels: list) -> list[str]:

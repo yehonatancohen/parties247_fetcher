@@ -170,56 +170,67 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
 def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
     """Add account1's upcoming parties (within 7 days) to the 'hot now' carousel."""
-    if db is None:
-        logger.warning("[HOT-NOW] No database — skipping")
-        return
-
     account1 = next((a for a in accounts if a.account_id == "account1"), None)
     if not account1:
         logger.warning("[HOT-NOW] No account1 found in accounts list")
         return
 
     try:
-        carousel = db.carousels.find_one({"title": {"$regex": "חם עכשיו"}})
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/carousels", timeout=10)
+        carousels = resp.json() if resp.status_code == 200 else []
     except Exception as exc:
-        logger.error(f"[HOT-NOW] Failed to find hot-now carousel: {exc}")
+        logger.error(f"[HOT-NOW] Failed to fetch carousels: {exc}")
         return
 
+    carousel = next((c for c in carousels if "חם עכשיו" in (c.get("title") or "")), None)
     if not carousel:
-        logger.warning("[HOT-NOW] No 'hot now' carousel found in DB")
+        logger.warning("[HOT-NOW] No 'hot now' carousel found")
         return
 
-    carousel_id = carousel["_id"]
+    carousel_id = carousel["id"]
+    current_ids = [str(pid) for pid in carousel.get("partyIds", [])]
+
+    try:
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties?upcoming=true", timeout=15)
+        all_parties = resp.json() if resp.status_code == 200 else []
+    except Exception as exc:
+        logger.error(f"[HOT-NOW] Failed to fetch parties: {exc}")
+        return
+
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(days=7)
     today_str = now.strftime("%Y-%m-%d")
     cutoff_str = cutoff.strftime("%Y-%m-%d")
 
-    try:
-        all_parties = list(db.parties.find({"referralCode": account1.referral}, {"_id": 1, "date": 1}))
-    except Exception as exc:
-        logger.error(f"[HOT-NOW] Failed to fetch account1 parties: {exc}")
-        return
-
+    new_ids = list(current_ids)
     added = 0
     for party in all_parties:
-        raw_date = party.get("date")
-        if not raw_date:
+        if party.get("referralCode") != account1.referral:
             continue
-        if isinstance(raw_date, datetime):
-            date_str = raw_date.strftime("%Y-%m-%d")
-        else:
-            date_str = str(raw_date)[:10]
-        if today_str <= date_str <= cutoff_str:
-            try:
-                result = db.carousels.update_one(
-                    {"_id": carousel_id},
-                    {"$addToSet": {"partyIds": party["_id"]}},
-                )
-                if result.modified_count:
-                    added += 1
-            except Exception as exc:
-                logger.warning(f"[HOT-NOW] Failed to add party {party['_id']}: {exc}")
+        raw_date = party.get("date") or party.get("startsAt", "")
+        date_str = str(raw_date)[:10]
+        if not (today_str <= date_str <= cutoff_str):
+            continue
+        party_id = str(party.get("_id") or party.get("id", ""))
+        if party_id and party_id not in new_ids:
+            new_ids.append(party_id)
+            added += 1
+
+    if added:
+        try:
+            headers = telegram_mgr._auth_headers()
+            resp = http_requests.put(
+                f"{config.BACKEND_URL}/api/admin/carousels/{carousel_id}/parties",
+                json={"partyIds": new_ids},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.error(f"[HOT-NOW] Failed to update carousel: {resp.status_code} {resp.text[:200]}")
+                added = 0
+        except Exception as exc:
+            logger.error(f"[HOT-NOW] Failed to update carousel: {exc}")
+            added = 0
 
     logger.info(f"[HOT-NOW] Added {added} new account1 parties to 'Hot Now' carousel")
     if added and telegram_mgr:

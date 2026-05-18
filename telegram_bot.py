@@ -65,10 +65,6 @@ class TelegramManager:
     def _sessions_collection(self):
         return self._db.goout_sessions if self._db is not None else None
 
-    @property
-    def _parties_collection(self):
-        return self._db.parties if self._db is not None else None
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -986,7 +982,8 @@ class TelegramManager:
                 return None
             goout_url = doc.get("goOutUrl") or doc.get("party_data", {}).get("goOutUrl")
             if goout_url:
-                party = self._parties_collection.find_one({"goOutUrl": goout_url}, {"_id": 1})
+                parties_coll = self._db.client["party247"].parties if self._db is not None else None
+                party = parties_coll.find_one({"goOutUrl": goout_url}, {"_id": 1}) if parties_coll else None
                 if party:
                     return str(party["_id"])
         except Exception as e:

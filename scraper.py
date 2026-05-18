@@ -391,8 +391,6 @@ class GoOutScraper:
     async def _scrape_organizer_panel(self, api_events_found: list) -> list[dict]:
         logger.info(f"[{self.account.account_id}] Loading organizer panel...")
 
-        my_events_url: list[str] = []  # mutable container so nonlocal isn't needed
-
         def _parse_events(data):
             def find_slugs(obj):
                 if isinstance(obj, dict):
@@ -420,6 +418,16 @@ class GoOutScraper:
                         find_slugs(item)
             find_slugs(data)
 
+        # Intercept myEvents requests and bump limit to 200 before they're sent
+        async def route_my_events(route):
+            url = route.request.url
+            new_url = re.sub(r'limit=\d+', 'limit=200', url)
+            if new_url != url:
+                logger.info(f"[{self.account.account_id}] Rewrote myEvents limit → 200")
+            await route.continue_(url=new_url)
+
+        await self._page.route("**/myEvents**", route_my_events)
+
         async def intercept_response(response):
             try:
                 ct = response.headers.get("content-type", "").lower()
@@ -428,9 +436,6 @@ class GoOutScraper:
                 url = response.url
                 if "userway" in url or "facebook" in url or "google" in url or "tiktok" in url:
                     return
-                if "myEvents" in url and not my_events_url:
-                    logger.info(f"[{self.account.account_id}] Detected myEvents API: {url}")
-                    my_events_url.append(url)
                 try:
                     data = await response.json()
                 except Exception:
@@ -472,37 +477,7 @@ class GoOutScraper:
         except Exception as e:
             logger.warning(f"[{self.account.account_id}] Could not ensure Events tab: {e}")
 
-        # Wait up to 30s for the first myEvents API call so we have auth context
-        for _ in range(10):
-            await self._page.wait_for_timeout(3000)
-            if my_events_url:
-                break
-
-        if my_events_url:
-            # Use the browser's authenticated session to fetch ALL events at once
-            logger.info(f"[{self.account.account_id}] Fetching all events via browser fetch (limit=200)...")
-            try:
-                base = my_events_url[0].split("myEvents")[0] + "myEvents"
-                current_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                full_url = f'{base}?skip=0&limit=200&filter={{"Title":"","activeEvents":true}}&currentDate={current_date}'
-                data = await self._page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const r = await fetch({json.dumps(full_url)}, {{credentials: 'include'}});
-                            return await r.json();
-                        }} catch(e) {{ return null; }}
-                    }}
-                """)
-                if data:
-                    before = len(api_events_found)
-                    _parse_events(data)
-                    logger.info(f"[{self.account.account_id}] Bulk fetch returned {len(api_events_found) - before} events (total {len(api_events_found)})")
-                    return api_events_found
-            except Exception as exc:
-                logger.warning(f"[{self.account.account_id}] Bulk fetch failed: {exc}, falling back to scroll")
-
-        # Fallback: scroll-and-wait if bulk fetch didn't work
-        logger.info(f"[{self.account.account_id}] Falling back to scroll strategy...")
+        # Fallback scroll strategy
         last_count = 0
         stable_ticks = 0
         for i in range(50):

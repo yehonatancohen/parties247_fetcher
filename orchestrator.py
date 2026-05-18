@@ -58,7 +58,20 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         telegram_mgr.send_message_sync("🔄 *Manual scan starting — sending all found parties...*")
 
     pending_coll = db.goout_pending if db is not None else None
-    parties_coll = db.parties if db is not None else None
+    parties_coll = db.client["party247"].parties if db is not None else None
+
+    def _party_exists(canonical: str) -> str | None:
+        """Return party name if already in DB, else None."""
+        if parties_coll is None:
+            return None
+        try:
+            doc = parties_coll.find_one(
+                {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
+                {"name": 1},
+            )
+            return doc.get("name") if doc else None
+        except Exception:
+            return None
 
     async def _scrape_one_account(account: GoOutAccount) -> int:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
@@ -81,19 +94,14 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     continue
 
                 canonical = normalize_url(event_url)
+                existing_name = _party_exists(canonical)
 
-                if not force_send and parties_coll is not None:
-                    try:
-                        existing = parties_coll.find_one({
-                            "$or": [
-                                {"canonicalUrl": canonical},
-                                {"goOutUrl": canonical},
-                            ]
-                        })
-                        if existing:
-                            continue
-                    except Exception:
-                        pass
+                if existing_name:
+                    if force_send and telegram_mgr:
+                        telegram_mgr.send_message_sync(
+                            f"✅ Already in DB: *{existing_name}*"
+                        )
+                    continue
 
                 # Try to scrape full event details via backend
                 party_data = _call_scrape_party(event_url)

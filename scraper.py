@@ -469,27 +469,27 @@ class GoOutScraper:
         except Exception as e:
             logger.warning(f"[{self.account.account_id}] Could not ensure Events tab: {e}")
 
-        for _ in range(3):
+        for _ in range(8):
             await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self._page.wait_for_timeout(2000)
-        await self._page.evaluate("window.scrollTo(0, 0)")
 
-        logger.info(f"[{self.account.account_id}] Waiting for API responses (up to 120s)...")
+        logger.info(f"[{self.account.account_id}] Waiting for API responses (up to 150s)...")
         last_count = 0
         stable_ticks = 0
-        for i in range(40):
+        for i in range(50):
             await self._page.wait_for_timeout(3000)
+            # Keep scrolling every tick to trigger infinite-scroll loading
+            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             current_count = len(api_events_found)
 
             if current_count > last_count:
                 stable_ticks = 0
                 last_count = current_count
-                logger.info(f"[{self.account.account_id}] {current_count} events so far — scrolling for more...")
-                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await self._page.wait_for_timeout(1000)
+                logger.info(f"[{self.account.account_id}] {current_count} events so far, still loading...")
             elif current_count >= 1:
                 stable_ticks += 1
-                if stable_ticks >= 3:
+                logger.info(f"[{self.account.account_id}] Stable tick {stable_ticks}/5 at {current_count} events")
+                if stable_ticks >= 5:
                     logger.info(f"[{self.account.account_id}] Stable at {current_count} events. Done.")
                     return api_events_found
             else:

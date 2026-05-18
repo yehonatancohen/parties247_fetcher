@@ -917,12 +917,18 @@ class TelegramManager:
     def _add_party_to_carousel(self, carousel_id: str, party_id: str) -> bool:
         try:
             headers = self._auth_headers()
-            carousels = self._get_all_carousels()
-            carousel = next((c for c in carousels if str(c.get("_id")) == carousel_id), None)
-            if carousel is None:
-                logger.warning(f"_add_party_to_carousel: carousel {carousel_id} not found")
-                return False
-            current_ids = [str(pid) for pid in carousel.get("partyIds", [])]
+            # Use the parties endpoint to get only currently-valid party IDs
+            parties_resp = http_requests.get(
+                f"{config.BACKEND_URL}/api/admin/carousels/{carousel_id}/parties",
+                headers=headers,
+                timeout=10,
+            )
+            if parties_resp.status_code == 200:
+                current_ids = [str(p.get("_id") or p.get("id", "")) for p in parties_resp.json()]
+                current_ids = [x for x in current_ids if x]
+            else:
+                logger.warning(f"_add_party_to_carousel: could not fetch carousel parties ({parties_resp.status_code})")
+                current_ids = []
             if party_id in current_ids:
                 return True
             resp = http_requests.put(

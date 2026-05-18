@@ -391,51 +391,54 @@ class GoOutScraper:
     async def _scrape_organizer_panel(self, api_events_found: list) -> list[dict]:
         logger.info(f"[{self.account.account_id}] Loading organizer panel...")
 
+        my_events_url: list[str] = []  # mutable container so nonlocal isn't needed
+
+        def _parse_events(data):
+            def find_slugs(obj):
+                if isinstance(obj, dict):
+                    eid = obj.get("EventSerial") or obj.get("_id") or obj.get("id") or obj.get("Id")
+                    slug = (
+                        obj.get("Url") or obj.get("url") or obj.get("slug") or
+                        obj.get("Slug") or obj.get("slugName") or
+                        obj.get("link") or obj.get("publicUrl")
+                    )
+                    if eid and slug and isinstance(slug, (str, int)) and "eventmanagement" not in str(slug):
+                        slug_str = str(slug)
+                        full_url = slug_str if "go-out.co" in slug_str else f"https://go-out.co/event/{slug_str}"
+                        if not any(e.get("go_out_id") == str(eid) for e in api_events_found):
+                            api_events_found.append({
+                                "url": full_url,
+                                "go_out_id": str(eid),
+                                "name": obj.get("Title") or obj.get("Name"),
+                                "source": "api_intercept",
+                            })
+                    for v in obj.values():
+                        if isinstance(v, (dict, list)):
+                            find_slugs(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        find_slugs(item)
+            find_slugs(data)
+
         async def intercept_response(response):
             try:
                 ct = response.headers.get("content-type", "").lower()
-                if response.ok and ("json" in ct or "text/plain" in ct or "application/octet-stream" in ct):
-                    url = response.url
-                    if "userway" in url or "facebook" in url or "google" in url or "tiktok" in url:
-                        return
+                if not (response.ok and ("json" in ct or "text/plain" in ct or "application/octet-stream" in ct)):
+                    return
+                url = response.url
+                if "userway" in url or "facebook" in url or "google" in url or "tiktok" in url:
+                    return
+                if "myEvents" in url and not my_events_url:
+                    logger.info(f"[{self.account.account_id}] Detected myEvents API: {url}")
+                    my_events_url.append(url)
+                try:
+                    data = await response.json()
+                except Exception:
                     try:
-                        data = await response.json()
+                        data = json.loads(await response.text())
                     except Exception:
-                        try:
-                            data = json.loads(await response.text())
-                        except Exception:
-                            return
-
-                    if "events" in url or "business" in url or "myEvents" in url:
-                        logger.info(f"[{self.account.account_id}] Potential Event API: {url}")
-
-                    def find_slugs(obj):
-                        if isinstance(obj, dict):
-                            eid = obj.get("EventSerial") or obj.get("_id") or obj.get("id") or obj.get("Id")
-                            slug = (
-                                obj.get("Url") or obj.get("url") or obj.get("slug") or
-                                obj.get("Slug") or obj.get("slugName") or
-                                obj.get("link") or obj.get("publicUrl")
-                            )
-                            if eid and slug and isinstance(slug, (str, int)) and "eventmanagement" not in str(slug):
-                                slug_str = str(slug)
-                                full_url = slug_str if "go-out.co" in slug_str else f"https://go-out.co/event/{slug_str}"
-                                if not any(e.get("go_out_id") == str(eid) for e in api_events_found):
-                                    logger.info(f"[{self.account.account_id}] API INTERCEPT: '{slug_str}' for #{eid}")
-                                    api_events_found.append({
-                                        "url": full_url,
-                                        "go_out_id": str(eid),
-                                        "name": obj.get("Title") or obj.get("Name"),
-                                        "source": "api_intercept",
-                                    })
-                            for v in obj.values():
-                                if isinstance(v, (dict, list)):
-                                    find_slugs(v)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                find_slugs(item)
-
-                    find_slugs(data)
+                        return
+                _parse_events(data)
             except Exception:
                 pass
 
@@ -469,16 +472,41 @@ class GoOutScraper:
         except Exception as e:
             logger.warning(f"[{self.account.account_id}] Could not ensure Events tab: {e}")
 
-        for _ in range(8):
-            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await self._page.wait_for_timeout(2000)
+        # Wait up to 30s for the first myEvents API call so we have auth context
+        for _ in range(10):
+            await self._page.wait_for_timeout(3000)
+            if my_events_url:
+                break
 
-        logger.info(f"[{self.account.account_id}] Waiting for API responses (up to 150s)...")
+        if my_events_url:
+            # Use the browser's authenticated session to fetch ALL events at once
+            logger.info(f"[{self.account.account_id}] Fetching all events via browser fetch (limit=200)...")
+            try:
+                base = my_events_url[0].split("myEvents")[0] + "myEvents"
+                current_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                full_url = f'{base}?skip=0&limit=200&filter={{"Title":"","activeEvents":true}}&currentDate={current_date}'
+                data = await self._page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const r = await fetch({json.dumps(full_url)}, {{credentials: 'include'}});
+                            return await r.json();
+                        }} catch(e) {{ return null; }}
+                    }}
+                """)
+                if data:
+                    before = len(api_events_found)
+                    _parse_events(data)
+                    logger.info(f"[{self.account.account_id}] Bulk fetch returned {len(api_events_found) - before} events (total {len(api_events_found)})")
+                    return api_events_found
+            except Exception as exc:
+                logger.warning(f"[{self.account.account_id}] Bulk fetch failed: {exc}, falling back to scroll")
+
+        # Fallback: scroll-and-wait if bulk fetch didn't work
+        logger.info(f"[{self.account.account_id}] Falling back to scroll strategy...")
         last_count = 0
         stable_ticks = 0
         for i in range(50):
             await self._page.wait_for_timeout(3000)
-            # Keep scrolling every tick to trigger infinite-scroll loading
             await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             current_count = len(api_events_found)
 
@@ -488,12 +516,10 @@ class GoOutScraper:
                 logger.info(f"[{self.account.account_id}] {current_count} events so far, still loading...")
             elif current_count >= 1:
                 stable_ticks += 1
-                logger.info(f"[{self.account.account_id}] Stable tick {stable_ticks}/5 at {current_count} events")
                 if stable_ticks >= 5:
                     logger.info(f"[{self.account.account_id}] Stable at {current_count} events. Done.")
                     return api_events_found
             else:
-                # No events yet — retry Events tab click every 7 ticks
                 if i > 0 and i % 7 == 0:
                     logger.info(f"[{self.account.account_id}] Still no API data. Retrying Events tab click...")
                     try:

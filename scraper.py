@@ -474,35 +474,46 @@ class GoOutScraper:
             await self._page.wait_for_timeout(2000)
         await self._page.evaluate("window.scrollTo(0, 0)")
 
-        logger.info(f"[{self.account.account_id}] Waiting for API responses (up to 72s)...")
-        for i in range(24):
-            if len(api_events_found) >= 1:
-                await self._page.wait_for_timeout(3000)
-                logger.info(f"[{self.account.account_id}] Caught {len(api_events_found)} events via API. Returning FAST.")
-                return api_events_found
-
-            if i > 0 and i % 7 == 0:
-                logger.info(f"[{self.account.account_id}] Still no API data. Retrying Events tab click...")
-                try:
-                    os.makedirs("scratch", exist_ok=True)
-                    await self._page.screenshot(path=f"scratch/debug_{self.account.account_id}_{i}.png")
-                    await self._page.evaluate("""
-                        () => {
-                            const targets = Array.from(document.querySelectorAll('button, div, a, li, span, img'));
-                            const eventsBtn = targets.find(el => {
-                                const txt = (el.innerText || "").trim();
-                                const src = (el.src || "").toLowerCase();
-                                return (txt === "אירועים" || txt === "Events" || src.includes("globe"));
-                            });
-                            if (eventsBtn) { eventsBtn.scrollIntoView(); eventsBtn.click(); }
-                        }
-                    """)
-                except Exception:
-                    pass
-
+        logger.info(f"[{self.account.account_id}] Waiting for API responses (up to 120s)...")
+        last_count = 0
+        stable_ticks = 0
+        for i in range(40):
             await self._page.wait_for_timeout(3000)
-            if i % 7 == 0:
-                logger.info(f"[{self.account.account_id}] Still waiting ({len(api_events_found)} found so far...)")
+            current_count = len(api_events_found)
+
+            if current_count > last_count:
+                stable_ticks = 0
+                last_count = current_count
+                logger.info(f"[{self.account.account_id}] {current_count} events so far — scrolling for more...")
+                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self._page.wait_for_timeout(1000)
+            elif current_count >= 1:
+                stable_ticks += 1
+                if stable_ticks >= 3:
+                    logger.info(f"[{self.account.account_id}] Stable at {current_count} events. Done.")
+                    return api_events_found
+            else:
+                # No events yet — retry Events tab click every 7 ticks
+                if i > 0 and i % 7 == 0:
+                    logger.info(f"[{self.account.account_id}] Still no API data. Retrying Events tab click...")
+                    try:
+                        os.makedirs("scratch", exist_ok=True)
+                        await self._page.screenshot(path=f"scratch/debug_{self.account.account_id}_{i}.png")
+                        await self._page.evaluate("""
+                            () => {
+                                const targets = Array.from(document.querySelectorAll('button, div, a, li, span, img'));
+                                const eventsBtn = targets.find(el => {
+                                    const txt = (el.innerText || "").trim();
+                                    const src = (el.src || "").toLowerCase();
+                                    return (txt === "אירועים" || txt === "Events" || src.includes("globe"));
+                                });
+                                if (eventsBtn) { eventsBtn.scrollIntoView(); eventsBtn.click(); }
+                            }
+                        """)
+                    except Exception:
+                        pass
+                if i % 7 == 0:
+                    logger.info(f"[{self.account.account_id}] Still waiting (0 found so far...)")
 
         if api_events_found:
             return api_events_found

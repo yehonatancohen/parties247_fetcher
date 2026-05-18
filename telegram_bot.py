@@ -40,6 +40,7 @@ _tfa_codes: dict[str, str | None] = {}
 _edit_sessions: dict[int, str] = {}
 _carousel_selections: dict[str, list[str]] = {}
 _pending_approve_info: dict[str, dict] = {}  # pending_id -> {url, referral}
+_approved_party_ids: dict[str, str] = {}  # pending_id -> party_db_id (cached after approval)
 
 
 class TelegramManager:
@@ -310,6 +311,7 @@ class TelegramManager:
                 # Apply pre-selected carousels automatically
                 applied_names = []
                 if party_db_id:
+                    _approved_party_ids[pending_id] = party_db_id
                     selections = _carousel_selections.pop(pending_id, [])
                     carousels = self._get_all_carousels()
                     for cid in selections:
@@ -403,12 +405,11 @@ class TelegramManager:
                 _carousel_selections[pending_id] = self._suggest_carousels(party_data_tmp, carousels)
             selections = _carousel_selections[pending_id]
             keyboard = self._build_carousel_keyboard(pending_id, carousels, selections)
-            await self._app.bot.send_message(
-                chat_id=self.manager_chat_id,
-                text="🎪 *Select carousels* _(tap to toggle, then Done)_",
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
+            # Edit the existing party message's keyboard in-place (no new message)
+            try:
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+            except Exception:
+                pass
 
         elif data.startswith("ctoggle:"):
             _, pending_id, carousel_id = data.split(":", 2)
@@ -430,26 +431,34 @@ class TelegramManager:
             selections = _carousel_selections.get(pending_id, [])
             party_db_id = self._find_party_db_id(pending_id)
             if party_db_id:
-                # Party already in DB — apply carousels now
                 _carousel_selections.pop(pending_id, None)
                 carousels = self._get_all_carousels()
                 added_to = []
                 for cid in selections:
                     if self._add_party_to_carousel(cid, party_db_id):
                         added_to += self._carousel_names_for_ids(carousels, [cid])
-                if added_to:
-                    await query.edit_message_text(f"✅ Added to: {', '.join(added_to)}")
-                else:
-                    await query.edit_message_text("✅ Saved (no carousels selected).")
+                result_text = f"🎪 Added to: *{', '.join(added_to)}*" if added_to else "🎪 No carousels selected."
             else:
-                # Pre-approval — just save the selection
-                await query.edit_message_text(
-                    f"✅ {len(selections)} carousel(s) saved — will be applied on approve."
+                result_text = f"🎪 {len(selections)} carousel(s) saved — will apply on approve."
+            # Restore approval keyboard and send result as a separate small message
+            try:
+                await query.edit_message_reply_markup(reply_markup=self._build_approval_keyboard(pending_id))
+            except Exception:
+                pass
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self.manager_chat_id, text=result_text, parse_mode="Markdown"
                 )
+            except Exception:
+                pass
 
         elif data.startswith("cskip:"):
-            _carousel_selections.pop(data.split(":", 1)[1], None)
-            await query.edit_message_text("⏭ Carousel assignment skipped.")
+            pending_id = data.split(":", 1)[1]
+            _carousel_selections.pop(pending_id, None)
+            try:
+                await query.edit_message_reply_markup(reply_markup=self._build_approval_keyboard(pending_id))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Text handler (2FA codes and edit JSON)
@@ -583,16 +592,7 @@ class TelegramManager:
             f"{carousel_line}"
         )
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pending_id}"),
-                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{pending_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pending_id}"),
-            ],
-            [
-                InlineKeyboardButton("🎪 Edit Carousels", callback_data=f"cshow:{pending_id}"),
-            ],
-        ])
+        keyboard = self._build_approval_keyboard(pending_id)
 
         try:
             if image_url:
@@ -886,6 +886,18 @@ class TelegramManager:
                 suggested.append(str(c["_id"]))
         return suggested
 
+    def _build_approval_keyboard(self, pending_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pending_id}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{pending_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pending_id}"),
+            ],
+            [
+                InlineKeyboardButton("🎪 Edit Carousels", callback_data=f"cshow:{pending_id}"),
+            ],
+        ])
+
     def _build_carousel_keyboard(self, pending_id: str, carousels: list, selected_ids: list[str]) -> InlineKeyboardMarkup:
         selected_set = set(selected_ids)
         rows = []
@@ -974,6 +986,8 @@ class TelegramManager:
             return {}
 
     def _find_party_db_id(self, pending_id: str) -> str | None:
+        if pending_id in _approved_party_ids:
+            return _approved_party_ids[pending_id]
         try:
             from bson.objectid import ObjectId
             coll = self._pending_collection

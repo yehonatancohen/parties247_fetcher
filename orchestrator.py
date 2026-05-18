@@ -58,20 +58,25 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         telegram_mgr.send_message_sync("🔄 *Manual scan starting — sending all found parties...*")
 
     pending_coll = db.goout_pending if db is not None else None
-    parties_coll = db.client["party247"].parties if db is not None else None
+
+    # Build a URL→name lookup from the backend once for the whole scrape run
+    known_parties: dict[str, str] = {}  # normalized_url -> party name
+    try:
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
+        if resp.status_code == 200:
+            for p in resp.json():
+                name = p.get("name", "")
+                for field in ("canonicalUrl", "goOutUrl", "originalUrl"):
+                    u = p.get(field)
+                    if u:
+                        known_parties[normalize_url(u)] = name
+            logger.info(f"Loaded {len(known_parties)} known party URLs from backend")
+    except Exception as exc:
+        logger.warning(f"Could not prefetch parties list: {exc}")
 
     def _party_exists(canonical: str) -> str | None:
         """Return party name if already in DB, else None."""
-        if parties_coll is None:
-            return None
-        try:
-            doc = parties_coll.find_one(
-                {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
-                {"name": 1},
-            )
-            return doc.get("name") if doc else None
-        except Exception:
-            return None
+        return known_parties.get(canonical)
 
     async def _scrape_one_account(account: GoOutAccount) -> int:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)

@@ -9,7 +9,9 @@ Writes directly to MongoDB for:
 """
 
 import asyncio
+import json
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 
 import requests as http_requests
@@ -35,6 +37,96 @@ def _call_scrape_party(url: str) -> dict | None:
         logger.warning(f"[SCRAPER] Backend returned {resp.status_code} for {url}: {resp.text[:200]}")
     except Exception as exc:
         logger.warning(f"[SCRAPER] Failed to call backend scrape-party for {url}: {exc}")
+    return None
+
+
+def _scrape_event_page(url: str) -> dict | None:
+    """Fetch a public Go-Out event page and extract party details from __NEXT_DATA__."""
+    try:
+        resp = http_requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"_scrape_event_page: {resp.status_code} for {url}")
+            return None
+
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+        if not m:
+            return None
+
+        data = json.loads(m.group(1))
+
+        def _find_evt(obj, depth=0):
+            if depth > 10:
+                return None
+            if isinstance(obj, dict):
+                if obj.get("EventSerial") and obj.get("StartingDate"):
+                    return obj
+                for v in obj.values():
+                    r = _find_evt(v, depth + 1)
+                    if r:
+                        return r
+            elif isinstance(obj, list):
+                for item in obj:
+                    r = _find_evt(item, depth + 1)
+                    if r:
+                        return r
+            return None
+
+        evt = _find_evt(data)
+        if not evt:
+            return None
+
+        date_raw = evt.get("StartingDate") or evt.get("startingDate") or ""
+        date_str = date_raw[:10] if date_raw else None
+
+        price = None
+        for ticket in (evt.get("Tickets") or []):
+            if ticket.get("Active", True):
+                t_price = ticket.get("Price")
+                if t_price and (price is None or t_price < price):
+                    price = t_price
+        if price is None:
+            price = evt.get("Price")
+
+        location = evt.get("Adress") or evt.get("EnglishAddress")
+
+        image_url = None
+        schema = evt.get("schemaOrg")
+        if isinstance(schema, list) and schema:
+            imgs = schema[0].get("image") or []
+            if imgs:
+                image_url = imgs[0]
+        if not image_url:
+            eid = evt.get("_id")
+            ts = evt.get("CoverImageTimestamp")
+            if eid and ts:
+                image_url = f"https://images.go-out.co/{eid}{ts}_coverImage.jpg"
+
+        result = {
+            "name": evt.get("Title") or evt.get("Name"),
+            "date": date_str,
+            "source": "go-out",
+        }
+        if price is not None:
+            result["ticketPrice"] = price
+        if location:
+            result["location"] = location
+        if image_url:
+            result["imageUrl"] = image_url
+        if evt.get("MusicType"):
+            result["musicType"] = evt["MusicType"]
+        if evt.get("EventType"):
+            result["eventType"] = evt["EventType"]
+        if evt.get("MinimumAge"):
+            result["age"] = str(evt["MinimumAge"])
+        if evt.get("Description"):
+            result["description"] = evt["Description"]
+        return result
+    except Exception as exc:
+        logger.warning(f"_scrape_event_page failed for {url}: {exc}")
     return None
 
 
@@ -108,8 +200,15 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                         )
                     continue
 
-                # Try to scrape full event details via backend
+                # Try to scrape full event details via backend, then direct page scrape
                 party_data = _call_scrape_party(event_url)
+
+                if not party_data:
+                    party_data = _scrape_event_page(event_url)
+                    if party_data:
+                        party_data["goOutUrl"] = canonical
+                        party_data["canonicalUrl"] = canonical
+                        logger.info(f"[{account.account_id}] Used direct page scrape for {event_url}")
 
                 if not party_data:
                     logger.info(f"Using discovery metadata for {event_url}")

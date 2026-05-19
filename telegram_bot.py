@@ -824,14 +824,17 @@ class TelegramManager:
 
     def _call_backend_reject(self, pending_id: str) -> bool:
         try:
-            resp = http_requests.post(
-                f"{config.BACKEND_URL}/api/admin/goout/reject/{pending_id}",
-                headers=self._auth_headers(),
-                timeout=15,
+            from bson.objectid import ObjectId
+            coll = self._pending_collection
+            if coll is None:
+                return False
+            result = coll.update_one(
+                {"_id": ObjectId(pending_id)},
+                {"$set": {"status": "rejected", "rejected_at": datetime.now(timezone.utc)}},
             )
-            return resp.status_code == 200
+            return result.modified_count > 0
         except Exception as exc:
-            logger.error(f"Failed to call backend reject: {exc}")
+            logger.error(f"Failed to reject pending doc {pending_id}: {exc}")
         return False
 
     def _call_backend_edit_approve(self, pending_id: str, edits: dict) -> dict | None:

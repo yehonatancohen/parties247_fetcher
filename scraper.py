@@ -404,10 +404,13 @@ class GoOutScraper:
                         slug_str = str(slug)
                         full_url = slug_str if "go-out.co" in slug_str else f"https://go-out.co/event/{slug_str}"
                         if not any(e.get("go_out_id") == str(eid) for e in api_events_found):
+                            date_raw = obj.get("StartingDate") or obj.get("startingDate") or ""
                             api_events_found.append({
                                 "url": full_url,
                                 "go_out_id": str(eid),
                                 "name": obj.get("Title") or obj.get("Name"),
+                                "date": date_raw[:10] if date_raw else None,
+                                "location": obj.get("Adress") or obj.get("EnglishAddress"),
                                 "source": "api_intercept",
                             })
                     for v in obj.values():

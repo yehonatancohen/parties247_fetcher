@@ -986,9 +986,12 @@ class TelegramManager:
         return []
 
     def _suggest_carousels(self, party_data: dict, carousels: list) -> list[str]:
-        tags = {t.lower() for t in party_data.get("tags", [])}
-        music = (party_data.get("musicType") or "").lower()
-        etype = (party_data.get("eventType") or "").lower()
+        raw_tags = party_data.get("tags") or []
+        tags = {t.lower() for t in (raw_tags if isinstance(raw_tags, list) else [raw_tags])}
+        music_raw = party_data.get("musicType") or ""
+        music = (music_raw if isinstance(music_raw, str) else " ".join(music_raw)).lower()
+        etype_raw = party_data.get("eventType") or ""
+        etype = (etype_raw if isinstance(etype_raw, str) else " ".join(etype_raw)).lower()
         region = (party_data.get("region") or "").lower()
         location = party_data.get("location") or {}
         if isinstance(location, dict):

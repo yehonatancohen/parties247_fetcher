@@ -53,6 +53,7 @@ class TelegramManager:
         self._thread: threading.Thread | None = None
         self._started = False
         self.on_scrape_requested: Callable | None = None
+        self.on_scrape_account_requested: Callable | None = None
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -186,14 +187,26 @@ class TelegramManager:
     async def _cmd_scrape(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_manager(update):
             return
-        await update.message.reply_text("🔄 Triggering manual scan...")
-        if self.on_scrape_requested:
-            def _run():
-                try:
-                    self.on_scrape_requested()
-                except Exception as exc:
-                    self.send_message_sync(f"❌ Scrape failed: {exc}")
-            threading.Thread(target=_run, daemon=True).start()
+        args = context.args or []
+        account_filter = args[0].lower() if args else None
+        if account_filter:
+            await update.message.reply_text(f"🔄 Triggering scan for *{account_filter}*...", parse_mode="Markdown")
+            if self.on_scrape_account_requested:
+                def _run_acct():
+                    try:
+                        self.on_scrape_account_requested(account_filter)
+                    except Exception as exc:
+                        self.send_message_sync(f"❌ Scrape failed: {exc}")
+                threading.Thread(target=_run_acct, daemon=True).start()
+        else:
+            await update.message.reply_text("🔄 Triggering manual scan...")
+            if self.on_scrape_requested:
+                def _run():
+                    try:
+                        self.on_scrape_requested()
+                    except Exception as exc:
+                        self.send_message_sync(f"❌ Scrape failed: {exc}")
+                threading.Thread(target=_run, daemon=True).start()
 
     async def _cmd_pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_manager(update):

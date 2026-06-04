@@ -82,6 +82,15 @@ def main():
         accounts, db, telegram_mgr, force_send=True
     )
 
+    def _scrape_single_account(account_id: str):
+        matched = [a for a in accounts if a.account_id == account_id]
+        if not matched:
+            telegram_mgr.send_message_sync(f"⚠️ Unknown account: *{account_id}*")
+            return
+        run_daily_scrape(matched, db, telegram_mgr, force_send=True)
+
+    telegram_mgr.on_scrape_account_requested = _scrape_single_account
+
     logger.info("Starting Telegram bot (polling)...")
     telegram_mgr.run_polling()
 

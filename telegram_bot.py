@@ -523,10 +523,14 @@ class TelegramManager:
     # ------------------------------------------------------------------
 
     def send_message_sync(self, text: str, parse_mode: str = "Markdown"):
-        if not self._loop or not self._app:
-            logger.warning("Telegram bot not started; cannot send message.")
-            return
-        asyncio.run_coroutine_threadsafe(self._send_text(text, parse_mode), self._loop)
+        try:
+            http_requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": self.manager_chat_id, "text": text, "parse_mode": parse_mode},
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.error(f"send_message_sync failed: {exc}")
 
     async def _send_text(self, text: str, parse_mode: str = "Markdown"):
         try:
@@ -537,11 +541,109 @@ class TelegramManager:
             logger.error(f"Failed to send Telegram message: {exc}")
 
     def send_party_for_approval_sync(self, pending_doc: dict):
-        if not self._loop or not self._app:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._send_pending_party_message(pending_doc), self._loop
+        """Send a party approval card synchronously via direct HTTP (no async loop needed)."""
+        try:
+            self._send_pending_party_message_sync(pending_doc)
+        except Exception as exc:
+            logger.error(f"send_party_for_approval_sync failed: {exc}")
+
+    def _send_pending_party_message_sync(self, pending_doc: dict):
+        """Synchronous version — sends via direct HTTP so it works from any thread."""
+        party = pending_doc.get("party_data", {}) or {}
+        pending_id = str(pending_doc.get("_id", ""))
+        account = pending_doc.get("account_id", "?")
+
+        # Cache URL + referral for approve flow
+        if pending_id:
+            cache_url = (
+                party.get("canonicalUrl")
+                or pending_doc.get("goOutUrl")
+                or party.get("goOutUrl")
+                or party.get("originalUrl")
+            )
+            _pending_approve_info[pending_id] = {
+                "url": cache_url,
+                "referral": party.get("referralCode"),
+            }
+
+        # Pre-compute carousel suggestions
+        carousels = self._get_all_carousels()
+        suggested_ids = self._suggest_carousels(party, carousels) if carousels else []
+        if carousels:
+            hot_now_id = self._hot_now_carousel_id(carousels)
+            if hot_now_id and self._is_account1(account) and self._is_within_days(party.get("date"), 7):
+                if hot_now_id not in suggested_ids:
+                    suggested_ids.append(hot_now_id)
+        if pending_id:
+            _carousel_selections[pending_id] = suggested_ids
+        carousel_names = self._carousel_names_for_ids(carousels, suggested_ids)
+
+        name = party.get("name", "Unknown Party")
+        date_str = party.get("date", "Unknown Date")
+        location = party.get("location", "Unknown Location")
+        price = party.get("ticketPrice")
+        sold_out = party.get("soldOut", False)
+        url = party.get("originalUrl") or party.get("goOutUrl", "")
+        image_url = party.get("imageUrl", "")
+
+        price_text = "🎫 Sold Out" if sold_out else (
+            f"💰 ₪{price:.0f}" if price else "💰 Free / Unknown"
         )
+        carousel_line = (
+            f"\n🎪 _{', '.join(self._escape_md(n) for n in carousel_names)}_"
+            if carousel_names else "\n🎪 _No carousels auto-selected_"
+        )
+        text = (
+            f"🎉 *New Party Found!*\n"
+            f"Account: {account}\n\n"
+            f"📛 *{self._escape_md(name)}*\n"
+            f"📅 {self._escape_md(str(date_str))}\n"
+            f"📍 {self._escape_md(str(location))}\n"
+            f"{price_text}\n"
+            f"🔗 [Go-Out Link]({url})"
+            f"{carousel_line}"
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": f"approve:{pending_id}"},
+                    {"text": "✏️ Edit",    "callback_data": f"edit:{pending_id}"},
+                    {"text": "❌ Reject",  "callback_data": f"reject:{pending_id}"},
+                ],
+                [
+                    {"text": "🎪 Edit Carousels", "callback_data": f"cshow:{pending_id}"},
+                ],
+            ]
+        }
+
+        base = f"https://api.telegram.org/bot{self.token}"
+        payload = {
+            "chat_id": self.manager_chat_id,
+            "parse_mode": "Markdown",
+            "reply_markup": keyboard,
+        }
+
+        if image_url:
+            try:
+                r = http_requests.post(
+                    f"{base}/sendPhoto",
+                    json={**payload, "photo": image_url, "caption": text},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    return
+            except Exception:
+                pass
+
+        try:
+            http_requests.post(
+                f"{base}/sendMessage",
+                json={**payload, "text": text, "disable_web_page_preview": False},
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to send party approval message: {exc}")
 
     async def _send_pending_party_message(self, pending_doc: dict):
         party = pending_doc.get("party_data", {}) or {}

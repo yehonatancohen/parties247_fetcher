@@ -23,6 +23,17 @@ from scraper import GoOutScraper, GoOutAccount
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_doc(obj):
+    """Recursively replace surrogate-containing strings so MongoDB won't reject them."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_doc(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_doc(v) for v in obj]
+    if isinstance(obj, str):
+        return obj.encode("utf-8", "replace").decode("utf-8")
+    return obj
+
+
 def _call_scrape_party(url: str) -> dict | None:
     """Call backend to scrape a party's full details."""
     try:
@@ -229,13 +240,13 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
                 if pending_coll is not None:
                     try:
-                        pending_doc = {
+                        pending_doc = _sanitize_doc({
                             "party_data": party_data,
                             "account_id": account.account_id,
                             "scraped_at": datetime.now(timezone.utc),
                             "status": "pending",
                             "goOutUrl": canonical,
-                        }
+                        })
 
                         pending_coll.insert_one(pending_doc)
 

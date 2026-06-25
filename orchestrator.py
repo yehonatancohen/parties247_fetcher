@@ -433,38 +433,16 @@ def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
         logger.error(f"[HOT-NOW] Failed to fetch parties: {exc}")
         return
 
-    now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(days=7)
-    today_str = now.strftime("%Y-%m-%d")
-    cutoff_str = cutoff.strftime("%Y-%m-%d")
-
-    # Build the correct set: account1 parties within the next 7 days
-    account1_upcoming: set[str] = set()
-    all_account1_ids: set[str] = set()
+    # Build the correct set: ALL upcoming account1 parties
+    account1_ids: set[str] = set()
     for party in all_parties:
         party_id = str(party.get("_id") or party.get("id", ""))
         if not party_id:
             continue
-        if party.get("referralCode") != account1.referral:
-            continue
-        all_account1_ids.add(party_id)
-        raw_date = party.get("date") or party.get("startsAt", "")
-        date_str = str(raw_date)[:10]
-        if today_str <= date_str <= cutoff_str:
-            account1_upcoming.add(party_id)
+        if party.get("referralCode") == account1.referral:
+            account1_ids.add(party_id)
 
-    # Rebuild: keep manually-added (non-account1) parties, replace account1 entries
-    # with only those within the 7-day window. This removes stale accumulated entries.
-    new_ids: list[str] = []
-    for pid in current_ids:
-        if pid in account1_upcoming:
-            new_ids.append(pid)          # account1 party within window — keep
-        elif pid not in all_account1_ids:
-            new_ids.append(pid)          # manually curated (not account1) — keep
-        # else: stale account1 party outside window — drop
-    for pid in account1_upcoming:
-        if pid not in set(new_ids):
-            new_ids.append(pid)          # newly eligible — add
+    new_ids: list[str] = list(account1_ids)
 
     changed = set(new_ids) != set(current_ids)
     if changed:

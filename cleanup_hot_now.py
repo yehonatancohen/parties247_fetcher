@@ -6,7 +6,10 @@ Usage:
     python cleanup_hot_now.py
 """
 import sys
+import io
 import requests
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import config
 

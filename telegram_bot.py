@@ -32,6 +32,7 @@ from telegram.ext import (
 )
 
 import config
+from carousel_suggester import suggest_carousels_for_party
 
 logger = logging.getLogger(__name__)
 
@@ -585,6 +586,7 @@ class TelegramManager:
         sold_out = party.get("soldOut", False)
         url = party.get("originalUrl") or party.get("goOutUrl", "")
         image_url = party.get("imageUrl", "")
+        possible_dup = party.get("possible_duplicate")
 
         price_text = "🎫 Sold Out" if sold_out else (
             f"💰 ₪{price:.0f}" if price else "💰 Free / Unknown"
@@ -593,6 +595,17 @@ class TelegramManager:
             f"\n🎪 _{', '.join(self._escape_md(n) for n in carousel_names)}_"
             if carousel_names else "\n🎪 _No carousels auto-selected_"
         )
+        dup_line = ""
+        if possible_dup:
+            dup_name = possible_dup.get("name", "?")
+            dup_src = possible_dup.get("source", "")
+            dup_img = possible_dup.get("imageUrl", "")
+            dup_img_link = f" [image]({dup_img})" if dup_img else ""
+            dup_line = (
+                f"\n\n⚠️ *POSSIBLE DUPLICATE* ({dup_src})\n"
+                f"Similar to: {dup_name}{dup_img_link}\n"
+                f"Compare images before approving!"
+            )
         text = (
             f"🎉 *New Party Found!*\n"
             f"Account: {account}\n\n"
@@ -602,6 +615,7 @@ class TelegramManager:
             f"{price_text}\n"
             f"🔗 [Go-Out Link]({url})"
             f"{carousel_line}"
+            f"{dup_line}"
         )
 
         keyboard = {
@@ -986,26 +1000,7 @@ class TelegramManager:
         return []
 
     def _suggest_carousels(self, party_data: dict, carousels: list) -> list[str]:
-        raw_tags = party_data.get("tags") or []
-        tags = {t.lower() for t in (raw_tags if isinstance(raw_tags, list) else [raw_tags])}
-        music_raw = party_data.get("musicType") or ""
-        music = (music_raw if isinstance(music_raw, str) else " ".join(music_raw)).lower()
-        etype_raw = party_data.get("eventType") or ""
-        etype = (etype_raw if isinstance(etype_raw, str) else " ".join(etype_raw)).lower()
-        region = (party_data.get("region") or "").lower()
-        location = party_data.get("location") or {}
-        if isinstance(location, dict):
-            location = (location.get("name") or "").lower()
-        else:
-            location = str(location).lower()
-        keywords = tags | {music, etype, region, location}
-        keywords.discard("")
-        suggested = []
-        for c in carousels:
-            title_lower = (c.get("title") or "").lower()
-            if any(kw and kw in title_lower for kw in keywords):
-                suggested.append(str(c["_id"]))
-        return suggested
+        return suggest_carousels_for_party(party_data, carousels)
 
     def _build_approval_keyboard(self, pending_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([

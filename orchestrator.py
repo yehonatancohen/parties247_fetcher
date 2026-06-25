@@ -19,6 +19,7 @@ import requests as http_requests
 import config
 from utils import normalize_url, normalized_or_none_for_dedupe, apply_default_referral, slugify_party
 from scraper import GoOutScraper, GoOutAccount
+from carousel_suggester import suggest_carousel_assignments
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,15 @@ def _scrape_event_page(url: str) -> dict | None:
     return None
 
 
+def _name_similarity(a: str, b: str) -> float:
+    """Word-overlap ratio between two party names (0.0–1.0)."""
+    a_words = set(a.lower().split())
+    b_words = set(b.lower().split())
+    if not a_words or not b_words:
+        return 0.0
+    return len(a_words & b_words) / max(len(a_words), len(b_words))
+
+
 def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
     """Synchronous entry point for the daily scrape job."""
     loop = asyncio.new_event_loop()
@@ -155,6 +165,9 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
     finally:
         loop.close()
 
+    run_hot_now_update(accounts, db, telegram_mgr)
+    run_carousel_auto_assign(telegram_mgr)
+
 
 async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
     if telegram_mgr and force_send:
@@ -164,6 +177,8 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
     # Build a URL→name lookup from the backend once for the whole scrape run
     known_parties: dict[str, str] = {}  # normalized_url -> party name
+    # (name, date YYYY-MM-DD, imageUrl) for name+date duplicate detection
+    known_name_date: list[tuple[str, str, str]] = []
     try:
         resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
         if resp.status_code == 200:
@@ -173,6 +188,10 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     u = p.get(field)
                     if u:
                         known_parties[normalize_url(u)] = name
+                date = (p.get("date") or "")[:10]
+                image = p.get("imageUrl") or p.get("image") or ""
+                if name and date:
+                    known_name_date.append((name, date, image))
             logger.info(f"Loaded {len(known_parties)} known party URLs from backend")
     except Exception as exc:
         logger.warning(f"Could not prefetch parties list: {exc}")
@@ -180,6 +199,37 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
     def _party_exists(canonical: str) -> str | None:
         """Return party name if already in DB, else None."""
         return known_parties.get(canonical)
+
+    def _find_duplicate(name: str, date: str) -> dict | None:
+        """Check for same-event different-account duplicates by name+date similarity."""
+        if not name or not date:
+            return None
+        party_date = date[:10]
+
+        # Check approved parties from backend
+        for k_name, k_date, k_image in known_name_date:
+            if k_date != party_date:
+                continue
+            if _name_similarity(name, k_name) >= 0.6 and name.lower() != k_name.lower():
+                return {"name": k_name, "imageUrl": k_image, "source": "approved"}
+
+        # Check parties already queued in this run
+        if pending_coll is not None:
+            try:
+                for doc in pending_coll.find(
+                    {"party_data.date": {"$regex": f"^{party_date}"}},
+                    {"party_data.name": 1, "party_data.imageUrl": 1},
+                ):
+                    pd = doc.get("party_data", {})
+                    p_name = pd.get("name", "")
+                    if not p_name or p_name.lower() == name.lower():
+                        continue
+                    if _name_similarity(name, p_name) >= 0.6:
+                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending"}
+            except Exception as exc:
+                logger.warning(f"Duplicate pending check failed: {exc}")
+
+        return None
 
     async def _scrape_one_account(account: GoOutAccount) -> int:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
@@ -238,6 +288,14 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     "slug", slugify_party(party_data.get("name"), party_data.get("date"))
                 )
 
+                dup = _find_duplicate(party_data.get("name", ""), party_data.get("date", ""))
+                if dup:
+                    party_data["possible_duplicate"] = dup
+                    logger.info(
+                        f"[{account.account_id}] Possible duplicate detected: "
+                        f"'{party_data.get('name')}' ~ '{dup['name']}' ({dup['source']})"
+                    )
+
                 if pending_coll is not None:
                     try:
                         pending_doc = _sanitize_doc({
@@ -289,6 +347,61 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
     except Exception:
         if telegram_mgr:
             telegram_mgr.send_message_sync(summary)
+
+
+def run_carousel_auto_assign(telegram_mgr):
+    """Auto-assign upcoming parties to existing carousels based on title heuristics."""
+    try:
+        suggestions = suggest_carousel_assignments(config.BACKEND_URL)
+    except Exception as exc:
+        logger.error(f"[CAROUSEL-AUTO] Failed to fetch suggestions: {exc}")
+        return
+
+    total_added = 0
+    for cid, info in suggestions.items():
+        to_add = info.get("to_add", [])
+        if not to_add:
+            continue
+
+        # Fetch current carousel state to avoid stale partyIds
+        try:
+            resp = http_requests.get(f"{config.BACKEND_URL}/api/carousels", timeout=10)
+            carousels = resp.json() if resp.status_code == 200 else []
+        except Exception as exc:
+            logger.error(f"[CAROUSEL-AUTO] Failed to refresh carousels: {exc}")
+            continue
+
+        carousel = next((c for c in carousels if str(c.get("id") or c.get("_id", "")) == cid), None)
+        if not carousel:
+            continue
+
+        current_ids = [str(pid) for pid in (carousel.get("partyIds") or [])]
+        current_set = set(current_ids)
+        new_ids = current_ids + [p["id"] for p in to_add if p["id"] not in current_set]
+
+        if len(new_ids) == len(current_ids):
+            continue
+
+        try:
+            headers = telegram_mgr._auth_headers() if telegram_mgr else {}
+            resp = http_requests.put(
+                f"{config.BACKEND_URL}/api/admin/carousels/{cid}/parties",
+                json={"partyIds": new_ids},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                added = len(new_ids) - len(current_ids)
+                total_added += added
+                logger.info(f"[CAROUSEL-AUTO] '{info['title']}': +{added} parties")
+            else:
+                logger.error(f"[CAROUSEL-AUTO] Failed for '{info['title']}': {resp.status_code} {resp.text[:200]}")
+        except Exception as exc:
+            logger.error(f"[CAROUSEL-AUTO] Error updating '{info['title']}': {exc}")
+
+    logger.info(f"[CAROUSEL-AUTO] Done. Total parties added across all carousels: {total_added}")
+    if total_added and telegram_mgr:
+        telegram_mgr.send_message_sync(f"🎠 *Carousel auto-assign*: {total_added} parties added across carousels.")
 
 
 def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):

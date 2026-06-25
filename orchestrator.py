@@ -438,21 +438,36 @@ def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
     today_str = now.strftime("%Y-%m-%d")
     cutoff_str = cutoff.strftime("%Y-%m-%d")
 
-    new_ids = list(current_ids)
-    added = 0
+    # Build the correct set: account1 parties within the next 7 days
+    account1_upcoming: set[str] = set()
+    all_account1_ids: set[str] = set()
     for party in all_parties:
+        party_id = str(party.get("_id") or party.get("id", ""))
+        if not party_id:
+            continue
         if party.get("referralCode") != account1.referral:
             continue
+        all_account1_ids.add(party_id)
         raw_date = party.get("date") or party.get("startsAt", "")
         date_str = str(raw_date)[:10]
-        if not (today_str <= date_str <= cutoff_str):
-            continue
-        party_id = str(party.get("_id") or party.get("id", ""))
-        if party_id and party_id not in new_ids:
-            new_ids.append(party_id)
-            added += 1
+        if today_str <= date_str <= cutoff_str:
+            account1_upcoming.add(party_id)
 
-    if added:
+    # Rebuild: keep manually-added (non-account1) parties, replace account1 entries
+    # with only those within the 7-day window. This removes stale accumulated entries.
+    new_ids: list[str] = []
+    for pid in current_ids:
+        if pid in account1_upcoming:
+            new_ids.append(pid)          # account1 party within window — keep
+        elif pid not in all_account1_ids:
+            new_ids.append(pid)          # manually curated (not account1) — keep
+        # else: stale account1 party outside window — drop
+    for pid in account1_upcoming:
+        if pid not in set(new_ids):
+            new_ids.append(pid)          # newly eligible — add
+
+    changed = set(new_ids) != set(current_ids)
+    if changed:
         try:
             headers = telegram_mgr._auth_headers()
             resp = http_requests.put(
@@ -463,11 +478,15 @@ def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
             )
             if resp.status_code != 200:
                 logger.error(f"[HOT-NOW] Failed to update carousel: {resp.status_code} {resp.text[:200]}")
-                added = 0
+                changed = False
         except Exception as exc:
             logger.error(f"[HOT-NOW] Failed to update carousel: {exc}")
-            added = 0
+            changed = False
 
-    logger.info(f"[HOT-NOW] Added {added} new account1 parties to 'Hot Now' carousel")
-    if added and telegram_mgr:
-        telegram_mgr.send_message_sync(f"🔥 *Hot Now* updated: {added} upcoming account1 parties added.")
+    removed = len(current_ids) - len([p for p in current_ids if p in set(new_ids)])
+    added = len([p for p in new_ids if p not in set(current_ids)])
+    logger.info(f"[HOT-NOW] Hot Now updated: +{added} added, -{removed} removed ({len(new_ids)} total)")
+    if changed and telegram_mgr:
+        telegram_mgr.send_message_sync(
+            f"🔥 *Hot Now* synced: +{added} added, -{removed} removed ({len(new_ids)} total)."
+        )

@@ -15,6 +15,7 @@ import config
 from orchestrator import run_daily_scrape
 from scraper import GoOutAccount
 from telegram_bot import TelegramManager
+from sales_tracker import run_sales_update
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,8 +67,19 @@ def main():
         id="daily_goout_scrape",
         replace_existing=True,
     )
+    # Sales data update every 4 hours (tracks confirmed/pending tickets and revenue)
+    scheduler.add_job(
+        func=lambda: run_sales_update(accounts, db, telegram_mgr),
+        trigger="interval",
+        hours=4,
+        id="sales_update",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info(f"Scheduler started — daily scrape (+ hot-now + carousel auto-assign) at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC")
+    logger.info(
+        f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC, "
+        "sales update every 4 hours"
+    )
 
     # Wire /scrape command to trigger a manual scan
     telegram_mgr.on_scrape_requested = lambda: run_daily_scrape(
@@ -82,6 +94,7 @@ def main():
         run_daily_scrape(matched, db, telegram_mgr, force_send=True)
 
     telegram_mgr.on_scrape_account_requested = _scrape_single_account
+    telegram_mgr.on_sales_update_requested = lambda: run_sales_update(accounts, db, telegram_mgr)
 
     logger.info("Starting Telegram bot (polling)...")
     telegram_mgr.run_polling()

@@ -33,6 +33,7 @@ from telegram.ext import (
 
 import config
 from carousel_suggester import suggest_carousels_for_party
+from sales_tracker import get_sales_summary, get_monthly_report, get_available_months, get_lifetime_total
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class TelegramManager:
         self._started = False
         self.on_scrape_requested: Callable | None = None
         self.on_scrape_account_requested: Callable | None = None
+        self.on_sales_update_requested: Callable | None = None
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -102,6 +104,9 @@ class TelegramManager:
         self._app.add_handler(CommandHandler("pending", self._cmd_pending))
         self._app.add_handler(CommandHandler("approve_all", self._cmd_approve_all))
         self._app.add_handler(CommandHandler("sessions", self._cmd_sessions))
+        self._app.add_handler(CommandHandler("sales", self._cmd_sales))
+        self._app.add_handler(CommandHandler("sales_monthly", self._cmd_sales_monthly))
+        self._app.add_handler(CommandHandler("sales_update", self._cmd_sales_update))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
         self._app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -152,6 +157,10 @@ class TelegramManager:
             "/pending — List pending parties\n"
             "/approve\\_all — Approve all pending\n"
             "/sessions — Go-Out session status\n"
+            "/sales — Ticket sales & earnings per event\n"
+            "/sales\\_monthly — This month's ticket sales\n"
+            "/sales\\_monthly 2025\\-11 — Sales for a specific past month\n"
+            "/sales\\_update — Trigger immediate sales scrape\n"
             "/cancel — Cancel current edit session\n"
             "/help — Show this message",
             parse_mode="Markdown",
@@ -180,8 +189,31 @@ class TelegramManager:
         except Exception:
             pass
         sessions_text = "\n".join(sessions_info) if sessions_info else "  No sessions found."
+
+        # Current month earnings
+        earnings_lines = []
+        try:
+            if self._db is not None:
+                ym = datetime.now(timezone.utc).strftime("%Y-%m")
+                report = get_monthly_report(self._db, ym)
+                if report["by_account"]:
+                    earnings_lines.append(f"\n💰 *Earnings this month ({ym})*")
+                    for aid in sorted(report["by_account"]):
+                        info = report["by_account"][aid]
+                        earnings_lines.append(
+                            f"  • {aid}: ₪{info['revenue']:.2f} ({info['tickets']} tickets)"
+                        )
+                    earnings_lines.append(
+                        f"  Total: ₪{report['total_revenue']:.2f}"
+                    )
+                else:
+                    earnings_lines.append("\n💰 No sales recorded this month yet.")
+        except Exception:
+            pass
+
+        earnings_text = "\n".join(earnings_lines)
         await update.message.reply_text(
-            f"📊 *Scraper Status*\n\nPending: {pending_count}\nSessions:\n{sessions_text}",
+            f"📊 *Scraper Status*\n\nPending: {pending_count}\nSessions:\n{sessions_text}{earnings_text}",
             parse_mode="Markdown",
         )
 
@@ -261,6 +293,148 @@ class TelegramManager:
                     for cid in selections:
                         self._add_party_to_carousel(cid, party_db_id)
         await update.message.reply_text(f"✅ Approved {approved}/{len(docs)} parties.")
+
+    async def _cmd_sales(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show per-event ticket counts, הכנסות, and lifetime earnings."""
+        if not self._is_manager(update):
+            return
+        if self._db is None:
+            await update.message.reply_text("⚠️ Database unavailable.")
+            return
+        try:
+            rows     = get_sales_summary(self._db)
+            lifetime = get_lifetime_total(self._db)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Error fetching sales: {exc}")
+            return
+
+        if not rows:
+            await update.message.reply_text(
+                "📊 No sales data yet\\. Run /sales\\_update first\\.",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        # Group by account
+        by_account: dict[str, list] = {}
+        for row in rows:
+            aid = row.get("account_id", "?")
+            by_account.setdefault(aid, []).append(row)
+
+        lines = ["📊 *Sales \\(Lifetime\\)*\n"]
+
+        for aid in sorted(by_account.keys()):
+            events = by_account[aid]
+            acct_lifetime = lifetime["by_account"].get(aid, {})
+            acct_rev = acct_lifetime.get("revenue", 0.0)
+            lines.append(f"*{self._escape_md(aid)}* — earned ₪{acct_rev:.2f} lifetime")
+
+            for e in sorted(events, key=lambda x: x.get("confirmed_count", 0), reverse=True):
+                name      = self._escape_md(e.get("event_name") or e.get("go_out_id", "?"))
+                confirmed = e.get("confirmed_count", 0)
+                pending   = e.get("pending_count", 0)
+                rev       = e.get("total_revenue_earned", 0.0)
+                price     = e.get("ticket_price")
+                gross     = e.get("event_revenue")  # הכנסות לאירוע
+
+                price_str = f" \\| ₪{price:.0f}/ticket" if price else ""
+                gross_str = f" \\| הכנסות: ₪{gross:.0f}" if gross else ""
+
+                lines.append(
+                    f"  • {name}{price_str}{gross_str}\n"
+                    f"    ✅ {confirmed} מאושרים · ⏳ {pending} ממתינים · 💰 ₪{rev:.2f}"
+                )
+            lines.append("")
+
+        total = lifetime.get("total_revenue", 0.0)
+        lines.append(f"💼 *Grand total lifetime: ₪{total:.2f}*")
+        lines.append("_Use /sales\\_monthly for monthly breakdown_")
+
+        msg = "\n".join(lines)
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n\\.\\.\\. \\(truncated\\)"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+
+    async def _cmd_sales_monthly(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show monthly revenue report. Optionally pass YYYY-MM as argument."""
+        if not self._is_manager(update):
+            return
+        if self._db is None:
+            await update.message.reply_text("⚠️ Database unavailable.")
+            return
+
+        args = context.args or []
+        year_month = args[0] if args else None
+
+        try:
+            available = get_available_months(self._db)
+        except Exception:
+            available = []
+
+        if not available:
+            await update.message.reply_text("📊 No monthly sales data yet\\.", parse_mode="MarkdownV2")
+            return
+
+        # If no month specified, show the current month plus list of available months
+        if year_month is None:
+            from datetime import datetime, timezone
+            year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        try:
+            report = get_monthly_report(self._db, year_month)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Error: {exc}")
+            return
+
+        ym_esc = self._escape_md(report["year_month"])
+        lines = [f"📅 *Monthly Report — {ym_esc}*\n"]
+
+        if not report["by_account"]:
+            lines.append("_No sales recorded for this month\\._")
+        else:
+            for aid in sorted(report["by_account"].keys()):
+                info = report["by_account"][aid]
+                lines.append(
+                    f"*{aid}* — {info['tickets']} tickets · ₪{info['revenue']:.2f} earned"
+                )
+                for ev in sorted(info["events"], key=lambda x: x["revenue"], reverse=True):
+                    name  = self._escape_md(ev.get("event_name") or ev.get("go_out_id", "?"))
+                    price = ev.get("ticket_price")
+                    price_str = f" \\(₪{price:.0f}/ticket\\)" if price else ""
+                    lines.append(
+                        f"  • {name}{price_str}\n"
+                        f"    {ev['tickets']} tickets · ₪{ev['revenue']:.2f}"
+                    )
+                lines.append("")
+
+            lines.append(
+                f"💼 *Total: {report['total_tickets']} tickets · ₪{report['total_revenue']:.2f}*"
+            )
+
+        # Show which months have data
+        avail_str = self._escape_md(", ".join(available))
+        lines.append(f"\n_Available months: {avail_str}_")
+        lines.append("_Use /sales\\_monthly YYYY\\-MM to view another month\\._")
+
+        msg = "\n".join(lines)
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n\\.\\.\\. \\(truncated\\)"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+
+    async def _cmd_sales_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Trigger an immediate sales data refresh."""
+        if not self._is_manager(update):
+            return
+        await update.message.reply_text("🔄 Triggering sales update...")
+        if self.on_sales_update_requested:
+            def _run():
+                try:
+                    self.on_sales_update_requested()
+                except Exception as exc:
+                    self.send_message_sync(f"❌ Sales update failed: {exc}")
+            threading.Thread(target=_run, daemon=True).start()
+        else:
+            await update.message.reply_text("⚠️ Sales update handler not configured.")
 
     async def _cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_manager(update):

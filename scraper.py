@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -354,6 +354,547 @@ class GoOutScraper:
         return await self._perform_login()
 
     # ------------------------------------------------------------------
+    # Sales data scraping
+    # ------------------------------------------------------------------
+
+    async def scrape_sales_data(self) -> list[dict]:
+        """
+        Scrape sales data from the business panel for every event (active and inactive).
+
+        Returns a list of dicts:
+            {go_out_id, event_name, confirmed, pending, ticket_price, event_revenue}
+
+        event_revenue = הכנסות לאירוע (total gross revenue shown on the panel).
+        For account2 the caller should use event_revenue × 6% directly.
+        ticket_price is the lowest active price, kept as a fallback.
+        """
+        api_sales: list[dict] = []
+
+        def _extract_sales_from_obj(obj):
+            if not isinstance(obj, dict):
+                return
+            # EventSerial is the numeric "#XXXXX" panel ID; prefer it over _id (MongoDB ObjectId)
+            eid = obj.get("EventSerial") or obj.get("eventSerial")
+            if not eid:
+                return
+            eid = str(eid)
+
+            # statistics sub-object: {"Accepted": N, "Pending": N, "Today": N, "Rejected": N}
+            stats = obj.get("statistics") or obj.get("Statistics") or {}
+            if not isinstance(stats, dict):
+                stats = {}
+
+            confirmed = None
+            for key in ("ConfirmedTickets", "confirmedTickets", "Approved", "approved",
+                        "ApprovedCount", "approvedCount", "ConfirmedCount", "confirmedCount",
+                        "TotalConfirmed", "totalConfirmed", "SoldTickets", "soldTickets"):
+                if obj.get(key) is not None:
+                    try:
+                        confirmed = int(obj[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if confirmed is None and stats.get("Accepted") is not None:
+                try:
+                    confirmed = int(stats["Accepted"])
+                except (TypeError, ValueError):
+                    pass
+
+            pending = None
+            for key in ("PendingTickets", "pendingTickets", "PendingCount", "pendingCount",
+                        "TotalPending", "totalPending", "WaitingTickets", "waitingTickets"):
+                if obj.get(key) is not None:
+                    try:
+                        pending = int(obj[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if pending is None and stats.get("Pending") is not None:
+                try:
+                    pending = int(stats["Pending"])
+                except (TypeError, ValueError):
+                    pass
+
+            # StartingDate is ISO: "2026-05-08T23:30:00.000" → "2026-05-08"
+            event_date = None
+            raw_date = obj.get("StartingDate") or obj.get("startingDate")
+            if isinstance(raw_date, str) and len(raw_date) >= 10:
+                event_date = raw_date[:10]
+
+            # Url is Go-Out's numeric public event identifier (e.g. "1780565778053")
+            event_url_id = obj.get("Url") or obj.get("url") or obj.get("EventUrl") or ""
+            if event_url_id:
+                event_url_id = str(event_url_id)
+
+            # הכנסות לאירוע — total event revenue (may not be accessible for salesperson roles)
+            event_revenue = None
+            for key in ("TotalRevenue", "totalRevenue", "EventRevenue", "eventRevenue",
+                        "Income", "income", "Incomes", "Revenue", "revenue",
+                        "TotalIncome", "totalIncome", "GrossRevenue", "grossRevenue"):
+                if obj.get(key) is not None:
+                    try:
+                        event_revenue = float(obj[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+
+            if confirmed is None and pending is None and event_revenue is None and event_date is None:
+                return
+
+            name = obj.get("Title") or obj.get("Name") or obj.get("name") or obj.get("title")
+
+            # Lowest active ticket price
+            price = None
+            for ticket in (obj.get("Tickets") or obj.get("tickets") or []):
+                if isinstance(ticket, dict) and ticket.get("Active", True):
+                    t_price = ticket.get("Price") or ticket.get("price")
+                    if t_price is not None:
+                        try:
+                            t_price = float(t_price)
+                            if price is None or t_price < price:
+                                price = t_price
+                        except (TypeError, ValueError):
+                            pass
+            if price is None:
+                raw = obj.get("Price") or obj.get("price") or obj.get("TicketPrice") or obj.get("ticketPrice")
+                if raw is not None:
+                    try:
+                        price = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+
+            existing = next((s for s in api_sales if s["go_out_id"] == eid), None)
+            if existing:
+                if confirmed is not None:
+                    existing["confirmed"] = confirmed
+                if pending is not None:
+                    existing["pending"] = pending
+                if price is not None and existing.get("ticket_price") is None:
+                    existing["ticket_price"] = price
+                if event_revenue is not None:
+                    existing["event_revenue"] = event_revenue
+                if event_date and not existing.get("event_date"):
+                    existing["event_date"] = event_date
+                if event_url_id and not existing.get("event_url_id"):
+                    existing["event_url_id"] = event_url_id
+            else:
+                api_sales.append({
+                    "go_out_id":     eid,
+                    "event_name":    str(name) if name else None,
+                    "confirmed":     confirmed if confirmed is not None else 0,
+                    "pending":       pending if pending is not None else 0,
+                    "ticket_price":  price,
+                    "event_revenue": event_revenue,
+                    "event_date":    event_date,
+                    "event_url_id":  event_url_id,
+                })
+
+        def _walk_for_sales(data, depth=0):
+            if depth > 12:
+                return
+            if isinstance(data, dict):
+                _extract_sales_from_obj(data)
+                for v in data.values():
+                    if isinstance(v, (dict, list)):
+                        _walk_for_sales(v, depth + 1)
+            elif isinstance(data, list):
+                for item in data:
+                    _walk_for_sales(item, depth)
+
+        async def _intercept_sales(response):
+            try:
+                ct = response.headers.get("content-type", "").lower()
+                if not (response.ok and ("json" in ct or "text/plain" in ct)):
+                    return
+                url = response.url
+                if any(x in url for x in ("userway", "facebook", "google", "tiktok")):
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                _walk_for_sales(data)
+            except Exception:
+                pass
+
+        self._page.on("response", _intercept_sales)
+
+        # Rewrite myEvents API requests: bump limit and remove activeEvents:true filter
+        async def route_my_events_sales(route):
+            url = route.request.url
+            new_url = re.sub(r'(limit=)\d+', r'\g<1>500', url)
+            if not re.search(r'[?&]limit=', new_url):
+                new_url += ('&' if '?' in new_url else '?') + 'limit=500'
+            # Remove activeEvents:true so ended events are included
+            # The colon may or may not be URL-encoded (%3A vs :)
+            new_url = re.sub(r'%22activeEvents%22(%3A|:)true', r'%22activeEvents%22\1false', new_url)
+            new_url = re.sub(r'"activeEvents"(:)true', r'"activeEvents"\1false', new_url)
+            if new_url != url:
+                logger.info(f"[{self.account.account_id}] Rewrote myEvents → {new_url}")
+            await route.continue_(url=new_url)
+
+        await self._page.route("**/myEvents**", route_my_events_sales)
+
+        await self._page.goto(GO_OUT_PANEL_URL, wait_until="domcontentloaded", timeout=30000)
+        await self._page.wait_for_timeout(3000)
+
+        # Click the Events tab
+        events_tab_selectors = [
+            'div[role="button"]:has(img[src*="MyEvents/globe"])',
+            'button:has(img[src*="MyEvents/globe"])',
+            'a[href="/businesspage"]',
+            'img[src*="MyEvents/globe"]',
+            'text="אירועים"',
+            'text="Events"',
+        ]
+        for sel in events_tab_selectors:
+            try:
+                tab = await self._page.query_selector(sel)
+                if tab:
+                    await tab.click(force=True)
+                    await self._page.wait_for_timeout(2000)
+                    break
+            except Exception:
+                pass
+
+        await self._dismiss_cookie_dialog()
+
+        # Wait for event-ID chips to appear
+        try:
+            await self._page.wait_for_function(
+                "() => document.body.innerText.match(/#\\d{4,8}/)",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+
+        # Try to switch the panel filter to show ALL events (active + ended)
+        try:
+            await self._page.evaluate("""
+                () => {
+                    const triggers = Array.from(document.querySelectorAll('button, div[role="button"], select'));
+                    const filter = triggers.find(el => {
+                        const t = (el.innerText || el.value || "").toLowerCase();
+                        return t.includes("active & pending") || t.includes("active and pending") ||
+                               t.includes("categorize") || t.includes("filter") ||
+                               t === "active" || t.includes("סינון") || t.includes("פעיל");
+                    });
+                    if (filter) { filter.scrollIntoView(); filter.click(); }
+                }
+            """)
+            await self._page.wait_for_timeout(1000)
+            await self._page.evaluate("""
+                () => {
+                    const opts = Array.from(document.querySelectorAll(
+                        'li, [role="option"], [role="menuitem"], option, div, button'
+                    ));
+                    const all = opts.find(el => {
+                        const t = (el.innerText || el.value || "").trim().toLowerCase();
+                        return t === "all" || t === "all events" || t === "הכל" ||
+                               t.includes("ended") || t.includes("past") || t.includes("הסתיים");
+                    });
+                    if (all) { all.scrollIntoView(); all.click(); }
+                }
+            """)
+            await self._page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
+        # Stabilised scroll loop — stop when visible DOM event count is stable for 4 ticks
+        last_dom_count = 0
+        stable_ticks = 0
+        for i in range(60):
+            await self._page.wait_for_timeout(2000)
+            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Count unique event-ID chips visible in the DOM (faster signal than API intercept)
+            current_dom = await self._page.evaluate(r"""
+                () => {
+                    const chips = Array.from(document.querySelectorAll('*')).filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return /^#\d{4,8}$/.test(t) && el.offsetParent !== null;
+                    });
+                    return new Set(chips.map(c => c.innerText.trim())).size;
+                }
+            """)
+            if current_dom > last_dom_count:
+                stable_ticks = 0
+                last_dom_count = current_dom
+                logger.info(f"[{self.account.account_id}] {current_dom} unique events visible, scrolling...")
+            else:
+                stable_ticks += 1
+                if stable_ticks >= 4 and i >= 3:
+                    logger.info(f"[{self.account.account_id}] DOM stable at {current_dom} events after {i+1} scrolls.")
+                    break
+
+        # DOM scrape — catches events not returned by the API
+        dom_sales = await self._scrape_sales_from_dom()
+        logger.info(f"[{self.account.account_id}] DOM found {len(dom_sales)} events")
+
+        # Merge DOM into API results
+        api_by_id: dict[str, dict] = {s["go_out_id"]: s for s in api_sales}
+        for dom_row in dom_sales:
+            eid = dom_row.get("go_out_id")
+            if not eid:
+                continue
+            if eid in api_by_id:
+                api_row = api_by_id[eid]
+                for field in ("ticket_price", "event_revenue", "confirmed", "pending", "event_date"):
+                    if api_row.get(field) is None and dom_row.get(field) is not None:
+                        api_row[field] = dom_row[field]
+                api_row.setdefault("finance_url", dom_row.get("finance_url"))
+                api_row.setdefault("status", dom_row.get("status"))
+            else:
+                api_sales.append(dom_row)
+                api_by_id[eid] = dom_row
+
+        if not api_sales and dom_sales:
+            api_sales = dom_sales
+
+        # Keep events from the last 30 days backwards AND all future events.
+        # Lower bound drops stale completed events; no upper bound so upcoming
+        # parties with pre-sold tickets are always included.
+        _now = datetime.now(timezone.utc)
+        _d_start = (_now - timedelta(days=30)).date()
+        _range_s = str(_d_start)
+        before = len(api_sales)
+        api_sales = [
+            item for item in api_sales
+            if item.get("event_date") and item["event_date"] >= _range_s
+        ]
+        logger.info(
+            f"[{self.account.account_id}] Date filter {_range_s}..future: "
+            f"{len(api_sales)} of {before} events"
+        )
+
+        # Fetch הכנסות לאירוע — discover the finance API via one page visit, then batch-fetch
+        await self._fetch_finance_revenue_parallel(api_sales)
+
+        logger.info(f"[{self.account.account_id}] Sales data: {len(api_sales)} events")
+        return api_sales
+
+    async def _fetch_ticket_price_via_api(self, event_url_id: str, go_out_id: str) -> float | None:
+        """
+        Fetch the public event details to extract the lowest ticket price.
+        Uses the event's Url field (numeric string like "1780565778053") as identifier.
+        Returns the lowest ticket price, or None if not found.
+        """
+        if not event_url_id:
+            return None
+        api_base = "https://api.fe.prod.go-out.co"
+        url_patterns = [
+            f"{api_base}/events/{event_url_id}",
+            f"{api_base}/events/getEvent/{event_url_id}",
+            f"{api_base}/events/event/{event_url_id}",
+            f"{api_base}/events/{go_out_id}",
+        ]
+        result = await self._page.evaluate(
+            r"""
+            async (urls) => {
+                for (const url of urls) {
+                    try {
+                        const r = await fetch(url, {credentials: 'include'});
+                        if (!r.ok) continue;
+                        const ct = r.headers.get('content-type') || '';
+                        if (!ct.includes('json')) continue;
+                        const data = await r.json();
+                        const j = JSON.stringify(data);
+                        // Look for ticket price
+                        const ticketKeys = ['"Price":', '"price":', '"TicketPrice":', '"ticketPrice":', '"amount":'];
+                        for (const k of ticketKeys) {
+                            let idx = j.indexOf(k);
+                            if (idx >= 0) {
+                                const rest = j.slice(idx + k.length).trimStart();
+                                const m = rest.match(/^([\d.]+)/);
+                                if (m && parseFloat(m[1]) > 0) {
+                                    return {url, price: parseFloat(m[1]), raw: j.slice(0, 200)};
+                                }
+                            }
+                        }
+                        return {url, price: null, raw: j.slice(0, 200)};
+                    } catch(e) {}
+                }
+                return null;
+            }
+            """,
+            url_patterns,
+        )
+        if result and result.get("price"):
+            logger.info(
+                f"[{self.account.account_id}] #{go_out_id} ticket_price={result['price']} from {result['url']}"
+            )
+            return float(result["price"])
+        if result:
+            logger.debug(
+                f"[{self.account.account_id}] #{go_out_id}: API {result['url']} no price. Raw: {result.get('raw','')!r}"
+            )
+        return None
+
+    async def _fetch_finance_revenue_parallel(self, sales: list[dict]):
+        """
+        Try to fill in ticket_price for events missing it, then derive event_revenue.
+        Revenue = confirmed_tickets × ticket_price (best available proxy for salesperson accounts).
+        """
+        needs_price = [item for item in sales
+                       if item.get("ticket_price") is None
+                       and item.get("event_revenue") is None
+                       and item.get("confirmed", 0) > 0]
+        if not needs_price:
+            # Derive event_revenue from already-known ticket_price
+            for item in sales:
+                if item.get("event_revenue") is None and item.get("ticket_price") and item.get("confirmed", 0) > 0:
+                    item["event_revenue"] = item["confirmed"] * item["ticket_price"]
+            return
+
+        logger.info(
+            f"[{self.account.account_id}] Fetching ticket prices for {len(needs_price)} events..."
+        )
+        for item in needs_price:
+            gid = item["go_out_id"]
+            url_id = item.get("event_url_id", "")
+            price = await self._fetch_ticket_price_via_api(url_id, gid)
+            if price is not None:
+                item["ticket_price"] = price
+
+        # Derive event_revenue from ticket_price × confirmed
+        for item in sales:
+            if item.get("event_revenue") is None and item.get("ticket_price") and item.get("confirmed", 0) > 0:
+                item["event_revenue"] = item["confirmed"] * item["ticket_price"]
+
+        found = sum(1 for item in sales if item.get("event_revenue") is not None)
+        logger.info(
+            f"[{self.account.account_id}] Revenue derived for {found}/{len(sales)} events"
+        )
+
+    async def _scrape_sales_from_dom(self) -> list[dict]:
+        """
+        Parse the Go-Out organizer panel event list.
+
+        The panel shows each event row with a "Ticket sales" cell containing:
+            Today X   Accepted X   Pending X
+        and a "View Finance" link.  Accepted = מאושרים, Pending = ממתינים.
+        """
+        # Dismiss cookie banner first
+        await self._dismiss_cookie_dialog()
+        await self._page.wait_for_timeout(1000)
+
+        try:
+            result = await self._page.evaluate(r"""
+                () => {
+                    const parseNum = (text) => {
+                        if (!text) return null;
+                        const clean = text.replace(/[,\s₪]/g, "");
+                        const n = parseFloat(clean);
+                        return isNaN(n) ? null : n;
+                    };
+
+                    // Each event row is a direct child container with a visible event name
+                    // The panel uses divs, not a <table>, so we look for rows that
+                    // contain an event ID chip like "#44650"
+                    const allEls = Array.from(document.querySelectorAll('*'));
+
+                    // Find elements that look like the event ID chip (#XXXXX)
+                    const idChips = allEls.filter(el => {
+                        const t = (el.innerText || "").trim();
+                        return /^#\d{4,8}$/.test(t) && el.offsetParent !== null;
+                    });
+
+                    const sales = [];
+
+                    for (const chip of idChips) {
+                        const goOutId = chip.innerText.trim().replace('#', '');
+
+                        // Walk up to the row container (wide enough to hold all columns)
+                        let row = chip;
+                        while (row && row.parentElement && row.offsetWidth < 600) {
+                            row = row.parentElement;
+                        }
+                        if (!row) continue;
+
+                        const rowText = row.innerText || "";
+
+                        // Extract event name: the largest text block in the row
+                        // (Name is the biggest element before the ID chip)
+                        let eventName = "";
+                        const nameEl = Array.from(row.querySelectorAll('*')).find(el => {
+                            if (el.children.length > 0) return false;
+                            const t = (el.innerText || "").trim();
+                            return t.length > 3 && !/^#\d/.test(t) &&
+                                   !["Today","Accepted","Pending","Active","Ended",
+                                     "Team member","View Finance","Refresh page"].includes(t);
+                        });
+                        if (nameEl) eventName = nameEl.innerText.trim();
+
+                        // Parse "Accepted X" from the ticket-sales cell
+                        const acceptedMatch = rowText.match(/Accepted\s+(\d+)/i);
+                        const pendingMatch  = rowText.match(/Pending\s+(\d+)/i);
+                        const todayMatch    = rowText.match(/Today\s+(\d+)/i);
+
+                        const accepted = acceptedMatch ? parseInt(acceptedMatch[1], 10) : 0;
+                        const pending  = pendingMatch  ? parseInt(pendingMatch[1],  10) : 0;
+                        const today    = todayMatch    ? parseInt(todayMatch[1],    10) : 0;
+
+                        // Status (Active / Ended / etc.)
+                        const statusMatch = rowText.match(/\b(Active|Ended|Draft|Cancelled)\b/i);
+                        const status = statusMatch ? statusMatch[1] : "";
+
+                        // "View Finance" link href — may contain event ID or finance path
+                        const financeLink = Array.from(row.querySelectorAll('a')).find(a =>
+                            (a.innerText || "").includes("Finance") ||
+                            (a.href || "").includes("finance")
+                        );
+                        const financeUrl = financeLink ? financeLink.href : null;
+
+                        // Extract event date from row text (YYYY-MM-DD)
+                        // Panel shows dates as "DD.MM.YYYY", "DD.MM.YY", "YYYY-MM-DD",
+                        // or just "DD.MM" (no year — infer from current date).
+                        let eventDate = null;
+                        const nowJs = new Date();
+                        const curYr = nowJs.getFullYear();
+                        const curMo = nowJs.getMonth() + 1;
+                        const isoM  = rowText.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+                        const dotM  = rowText.match(/\b(\d{1,2})\.(\d{1,2})\.(2\d{3})\b/);
+                        const shrtM = rowText.match(/\b(\d{1,2})\.(\d{1,2})\.(2\d)\b/);
+                        const noYrM = rowText.match(/\b(\d{1,2})\.(\d{1,2})\b(?!\.)/);
+                        if (isoM) {
+                            eventDate = isoM[0];
+                        } else if (dotM) {
+                            eventDate = `${dotM[3]}-${dotM[2].padStart(2,'0')}-${dotM[1].padStart(2,'0')}`;
+                        } else if (shrtM) {
+                            const yr = 2000 + parseInt(shrtM[3]);
+                            eventDate = `${yr}-${shrtM[2].padStart(2,'0')}-${shrtM[1].padStart(2,'0')}`;
+                        } else if (noYrM) {
+                            const mo = parseInt(noYrM[2]);
+                            const dy = parseInt(noYrM[1]);
+                            if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+                                // month <= current month → this year, else last year
+                                const yr = mo <= curMo ? curYr : curYr - 1;
+                                eventDate = `${yr}-${noYrM[2].padStart(2,'0')}-${noYrM[1].padStart(2,'0')}`;
+                            }
+                        }
+
+                        sales.push({
+                            go_out_id:     goOutId,
+                            event_name:    eventName,
+                            confirmed:     accepted,
+                            today:         today,
+                            pending:       pending,
+                            status:        status,
+                            finance_url:   financeUrl,
+                            ticket_price:  null,
+                            event_revenue: null,
+                            event_date:    eventDate,
+                        });
+                    }
+
+                    return sales;
+                }
+            """)
+            return result or []
+        except Exception as exc:
+            logger.warning(f"[{self.account.account_id}] DOM sales scrape failed: {exc}")
+            return []
+
+    # ------------------------------------------------------------------
     # Event discovery
     # ------------------------------------------------------------------
 
@@ -599,8 +1140,8 @@ class GoOutScraper:
                     const elements = Array.from(document.querySelectorAll('*'));
                     for (const el of elements) {
                         try {
-                            if (el.children.length === 0 && el.innerText && /#\d{5,6}/.test(el.innerText)) {
-                                const idMatch = el.innerText.match(/#(\d{5,6})/);
+                            if (el.children.length === 0 && el.innerText && /#\\d{5,6}/.test(el.innerText)) {
+                                const idMatch = el.innerText.match(/#(\\d{5,6})/);
                                 const id = idMatch[1];
                                 let row = el;
                                 while (row && row.parentElement && row.offsetWidth < 200) {

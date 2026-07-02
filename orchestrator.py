@@ -13,13 +13,14 @@ import json
 import logging
 import re
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 import requests as http_requests
 
 import config
 from utils import normalize_url, normalized_or_none_for_dedupe, apply_default_referral, slugify_party
 from scraper import GoOutScraper, GoOutAccount
-from carousel_suggester import suggest_carousel_assignments
+from carousel_suggester import suggest_carousel_assignments, suggest_carousels_for_party
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,20 @@ def _name_similarity(a: str, b: str) -> float:
     return len(a_words & b_words) / max(len(a_words), len(b_words))
 
 
+_TEST_INDICATORS = frozenset([
+    "test", "copy of", "בדיקה", "אירוע בדיקתי", "העתק של", "demo", "dummy",
+    "העתק", "טסט",
+])
+
+
+def _is_test_event(name: str) -> bool:
+    """Return True if the event name looks like a test/draft/copy event."""
+    if not name:
+        return False
+    name_lower = name.lower()
+    return any(indicator in name_lower for indicator in _TEST_INDICATORS)
+
+
 def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
     """Synchronous entry point for the daily scrape job."""
     loop = asyncio.new_event_loop()
@@ -251,15 +266,31 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                 if not event_url:
                     continue
 
-                canonical = normalize_url(event_url)
-                existing_name = _party_exists(canonical)
+                # Early filter: skip test/demo events by name from discovery
+                if _is_test_event(entry.get("name", "")):
+                    logger.info(f"[{account.account_id}] Skipping test event: '{entry.get('name')}'")
+                    continue
 
+                canonical = normalize_url(event_url)
+
+                # Skip if already approved in backend
+                existing_name = _party_exists(canonical)
                 if existing_name:
                     if force_send and telegram_mgr:
-                        telegram_mgr.send_message_sync(
-                            f"✅ Already in DB: *{existing_name}*"
-                        )
+                        telegram_mgr.send_message_sync(f"✅ Already in DB: *{existing_name}*")
                     continue
+
+                # Skip if already in pending (prevents daily re-sends of unapproved parties)
+                if pending_coll is not None:
+                    try:
+                        existing_pending = pending_coll.find_one(
+                            {"goOutUrl": canonical, "status": {"$ne": "rejected"}}
+                        )
+                        if existing_pending:
+                            logger.info(f"[{account.account_id}] Already in pending, skipping: {canonical}")
+                            continue
+                    except Exception as exc:
+                        logger.warning(f"[{account.account_id}] Pending dedup check failed: {exc}")
 
                 # Try to scrape full event details via backend, then direct page scrape
                 party_data = _call_scrape_party(event_url)
@@ -282,6 +313,11 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                         "source": "go-out",
                     }
 
+                # Second filter: skip test events found in full scraped name
+                if _is_test_event(party_data.get("name", "")):
+                    logger.info(f"[{account.account_id}] Skipping test event (full name): '{party_data.get('name')}'")
+                    continue
+
                 party_data["referralCode"] = account.referral
                 apply_default_referral(party_data, account.referral)
                 party_data.setdefault(
@@ -292,31 +328,102 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                 if dup:
                     party_data["possible_duplicate"] = dup
                     logger.info(
-                        f"[{account.account_id}] Possible duplicate detected: "
+                        f"[{account.account_id}] Possible duplicate: "
                         f"'{party_data.get('name')}' ~ '{dup['name']}' ({dup['source']})"
                     )
 
-                if pending_coll is not None:
-                    try:
-                        pending_doc = _sanitize_doc({
-                            "party_data": party_data,
-                            "account_id": account.account_id,
-                            "scraped_at": datetime.now(timezone.utc),
-                            "status": "pending",
-                            "goOutUrl": canonical,
-                        })
+                # Auto-approve: call backend directly without human review
+                try:
+                    clean_url = canonical.split("?ref=")[0].split("&ref=")[0]
+                    headers = telegram_mgr._auth_headers()
 
-                        pending_coll.insert_one(pending_doc)
+                    r1 = http_requests.post(
+                        f"{config.BACKEND_URL}/api/admin/add-party",
+                        json={"url": clean_url},
+                        headers=headers,
+                        timeout=60,
+                    )
+                    if r1.status_code not in (200, 201, 409):
+                        logger.warning(
+                            f"[{account.account_id}] Auto-approve returned {r1.status_code} "
+                            f"for {clean_url}: {r1.text[:200]}"
+                        )
+                        await asyncio.sleep(2)
+                        continue
 
-                        if telegram_mgr:
-                            telegram_mgr.send_party_for_approval_sync(pending_doc)
-                        new_count += 1
-                    except Exception as exc:
-                        logger.error(f"Failed to handle party: {exc}")
+                    d1 = r1.json()
+                    party_db_id = (d1.get("party") or {}).get("_id") or d1.get("id")
+
+                    # Apply account referral code to the party URL
+                    if party_db_id and account.referral:
+                        parsed = urlparse(clean_url)
+                        qs = parse_qsl(parsed.query, keep_blank_values=True)
+                        if not any(k.lower() == "ref" for k, _ in qs):
+                            qs.append(("ref", account.referral))
+                        goout_with_ref = urlunparse(parsed._replace(query=urlencode(qs)))
+                        http_requests.put(
+                            f"{config.BACKEND_URL}/api/admin/update-party/{party_db_id}",
+                            json={
+                                "referralCode": account.referral,
+                                "goOutUrl": goout_with_ref,
+                                "originalUrl": goout_with_ref,
+                            },
+                            headers=headers,
+                            timeout=15,
+                        )
+
+                    # Auto-assign to matching carousels
+                    applied_carousel_titles: list[str] = []
+                    if party_db_id and telegram_mgr:
+                        carousels = telegram_mgr._get_all_carousels()
+                        suggested_ids = suggest_carousels_for_party(party_data, carousels)
+                        for cid in suggested_ids:
+                            if telegram_mgr._add_party_to_carousel(cid, party_db_id):
+                                c = next(
+                                    (c for c in carousels
+                                     if str(c.get("id") or c.get("_id", "")) == cid),
+                                    None,
+                                )
+                                if c:
+                                    applied_carousel_titles.append(c.get("title", cid))
+
+                    # Log to pending for audit trail
+                    if pending_coll is not None:
+                        try:
+                            pending_coll.insert_one(_sanitize_doc({
+                                "party_data": party_data,
+                                "account_id": account.account_id,
+                                "scraped_at": datetime.now(timezone.utc),
+                                "status": "auto_approved",
+                                "goOutUrl": canonical,
+                                "party_db_id": party_db_id,
+                                "applied_carousels": applied_carousel_titles,
+                            }))
+                        except Exception as exc:
+                            logger.warning(f"Could not log auto-approve to pending: {exc}")
+
+                    # Send compact notification
+                    name_str = party_data.get("name") or "?"
+                    date_str = (party_data.get("date") or "?")[:10]
+                    dup_flag = " ⚠️ possible dup" if dup else ""
+                    carousel_str = (", ".join(applied_carousel_titles)
+                                    if applied_carousel_titles else "none")
+                    if telegram_mgr:
+                        telegram_mgr.send_message_sync(
+                            f"✅ *Auto-added:* {name_str}\n"
+                            f"📅 {date_str}{dup_flag}\n"
+                            f"🎠 {carousel_str}"
+                        )
+
+                    known_parties[canonical] = name_str  # prevent re-adding in same run
+                    new_count += 1
+
+                except Exception as exc:
+                    logger.error(f"[{account.account_id}] Auto-approve error for {canonical}: {exc}")
 
                 await asyncio.sleep(2)
 
-            logger.info(f"[{account.account_id}] Processed {new_count} new events")
+            logger.info(f"[{account.account_id}] Auto-approved {new_count} new events")
         except Exception as exc:
             logger.error(f"[{account.account_id}] Scrape error: {exc}")
             if telegram_mgr:

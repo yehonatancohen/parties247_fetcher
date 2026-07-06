@@ -77,7 +77,7 @@ def run_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=None):
 
 async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=None):
     results = await asyncio.gather(
-        *[_update_account(account, db) for account in accounts],
+        *[_update_account(account, db, telegram_mgr) for account in accounts],
         return_exceptions=True,
     )
     any_error = False
@@ -97,8 +97,8 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
             logger.error(f"Failed to send sales summary to Telegram: {exc}")
 
 
-async def _update_account(account: GoOutAccount, db):
-    scraper = GoOutScraper(account, db=db)
+async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
+    scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
     try:
         ok = await scraper.ensure_session()
         if not ok:
@@ -376,6 +376,6 @@ def format_sales_telegram_summary(db, year_month: str | None = None) -> str:
 
         lines.append("")
 
-    lines.append(f"💼 *Total {month_label}: ₪{grand_total_revenue:.2f}* | {grand_total_tickets} tickets")
+    lines.append(f"💼 *Total {year_month}: ₪{grand_total_revenue:.2f}* | {grand_total_tickets} tickets")
 
     return "\n".join(lines)

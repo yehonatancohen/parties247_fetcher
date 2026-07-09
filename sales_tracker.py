@@ -80,18 +80,20 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
         *[_update_account(account, db, telegram_mgr) for account in accounts],
         return_exceptions=True,
     )
-    any_error = False
+    new_sales = []
     for account, result in zip(accounts, results):
         if isinstance(result, Exception):
-            any_error = True
             logger.error(f"[{account.account_id}] Sales update error: {result}")
             if telegram_mgr:
                 telegram_mgr.send_message_sync(
                     f"⚠️ Sales update failed for *{account.account_id}*: {result}"
                 )
-    if telegram_mgr and not any_error:
+        else:
+            new_sales.extend(result or [])
+
+    if telegram_mgr and new_sales:
         try:
-            msg = format_sales_telegram_summary(db)
+            msg = format_new_sales_telegram_summary(new_sales)
             telegram_mgr.send_message_sync(msg)
         except Exception as exc:
             logger.error(f"Failed to send sales summary to Telegram: {exc}")
@@ -99,11 +101,12 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
 
 async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
     scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
+    new_sales = []
     try:
         ok = await scraper.ensure_session()
         if not ok:
             logger.warning(f"[{account.account_id}] Could not log in for sales update")
-            return
+            return new_sales
 
         live_sales = await scraper.scrape_sales_data()
         now = datetime.now(timezone.utc)
@@ -167,6 +170,13 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     f"revenue delta=₪{delta_event_revenue or 0:.2f} → "
                     f"earned ₪{rev:.2f}"
                 )
+                new_sales.append({
+                    "account_id":          account.account_id,
+                    "event_name":          event_name or go_out_id,
+                    "delta_confirmed":     delta_confirmed,
+                    "delta_event_revenue": delta_event_revenue,
+                    "revenue_earned":      rev,
+                })
 
             # Upsert the latest snapshot
             sales_coll.update_one(
@@ -186,6 +196,8 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
 
     finally:
         await scraper.close()
+
+    return new_sales
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +329,33 @@ def get_available_months(db) -> list[str]:
         {"$sort": {"_id": 1}},
     ]
     return [doc["_id"] for doc in db.goout_sales_log.aggregate(pipeline)]
+
+
+def format_new_sales_telegram_summary(new_sales: list[dict]) -> str:
+    """Build a Telegram message reporting only the new sales seen this check."""
+    lines = ["🎉 *New sale(s) detected*\n"]
+    total_revenue = 0.0
+    total_tickets = 0
+
+    by_account: dict[str, list[dict]] = {}
+    for sale in new_sales:
+        by_account.setdefault(sale["account_id"], []).append(sale)
+
+    for aid in sorted(by_account.keys()):
+        lines.append(f"🔹 *{aid}*")
+        for sale in by_account[aid]:
+            delta_confirmed = sale["delta_confirmed"]
+            rev = sale["revenue_earned"]
+            total_revenue += rev
+            total_tickets += max(0, delta_confirmed)
+            name = sale["event_name"][:45]
+            confirmed_str = f"+{delta_confirmed}" if delta_confirmed else "±0"
+            lines.append(f"  • {name}  ✅{confirmed_str}  →₪{rev:.2f}")
+        lines.append("")
+
+    lines.append(f"💼 *Total: ₪{total_revenue:.2f}* | {total_tickets} tickets")
+
+    return "\n".join(lines)
 
 
 def format_sales_telegram_summary(db, year_month: str | None = None) -> str:

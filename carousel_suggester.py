@@ -189,8 +189,8 @@ def suggest_carousels_for_party(party: dict, carousels: list) -> list[str]:
     for carousel in carousels:
         cid = str(carousel.get("id") or carousel.get("_id", ""))
         title = carousel.get("title") or ""
-        if "חם עכשיו" in title:
-            continue  # hot-now is handled separately
+        if _contains(title, ["חם עכשיו", "hot now"]):
+            continue  # hot-now is account1-only, managed by run_hot_now_update
         matchers = _build_matchers(title)
         if not matchers:
             continue
@@ -227,6 +227,11 @@ def suggest_carousel_assignments(backend_url: str) -> dict:
         cid = str(carousel.get("id") or carousel.get("_id", ""))
         title = carousel.get("title") or ""
         current_ids = {str(pid) for pid in (carousel.get("partyIds") or [])}
+
+        if _contains(title, ["חם עכשיו", "hot now"]):
+            # hot-now is account1-only, managed exclusively by run_hot_now_update
+            results[cid] = {"title": title, "already_in": len(current_ids), "to_add": [], "hot_now": True}
+            continue
 
         matchers = _build_matchers(title)
         if not matchers:

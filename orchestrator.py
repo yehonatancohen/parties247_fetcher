@@ -246,9 +246,9 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
         return None
 
-    async def _scrape_one_account(account: GoOutAccount) -> int:
+    async def _scrape_one_account(account: GoOutAccount) -> list[str]:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
-        new_count = 0
+        added_lines: list[str] = []
         try:
             session_ok = await scraper.ensure_session()
             if not session_ok:
@@ -402,58 +402,72 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                         except Exception as exc:
                             logger.warning(f"Could not log auto-approve to pending: {exc}")
 
-                    # Send compact notification
+                    # Collect for the end-of-run summary message
                     name_str = party_data.get("name") or "?"
                     date_str = (party_data.get("date") or "?")[:10]
                     dup_flag = " ⚠️ possible dup" if dup else ""
                     carousel_str = (", ".join(applied_carousel_titles)
                                     if applied_carousel_titles else "none")
-                    if telegram_mgr:
-                        telegram_mgr.send_message_sync(
-                            f"✅ *Auto-added:* {name_str}\n"
-                            f"📅 {date_str}{dup_flag}\n"
-                            f"🎠 {carousel_str}"
-                        )
+                    added_lines.append(
+                        f"• *{name_str}* — 📅 {date_str}{dup_flag} — 🎠 {carousel_str}"
+                    )
 
                     known_parties[canonical] = name_str  # prevent re-adding in same run
-                    new_count += 1
 
                 except Exception as exc:
                     logger.error(f"[{account.account_id}] Auto-approve error for {canonical}: {exc}")
 
                 await asyncio.sleep(2)
 
-            logger.info(f"[{account.account_id}] Auto-approved {new_count} new events")
+            logger.info(f"[{account.account_id}] Auto-approved {len(added_lines)} new events")
         except Exception as exc:
             logger.error(f"[{account.account_id}] Scrape error: {exc}")
             if telegram_mgr:
                 telegram_mgr.send_message_sync(f"❌ Error scraping *{account.account_id}*: {exc}")
         finally:
             await scraper.close()
-        return new_count
+        return added_lines
 
     results = await asyncio.gather(
         *[_scrape_one_account(a) for a in accounts], return_exceptions=True
     )
-    total_new = sum(r for r in results if isinstance(r, int))
+    all_added: list[str] = []
+    for r in results:
+        if isinstance(r, list):
+            all_added.extend(r)
 
     summary = (
         f"✅ *Scrape complete!*\n"
-        f"Found {total_new} new events across {len(accounts)} accounts."
+        f"Found {len(all_added)} new events across {len(accounts)} accounts."
     )
-    try:
-        resp = http_requests.post(
-            f"https://api.telegram.org/bot{telegram_mgr.token}/sendMessage",
-            json={
-                "chat_id": telegram_mgr.manager_chat_id,
-                "text": summary,
-                "parse_mode": "Markdown",
-            },
-            timeout=10,
-        )
-    except Exception:
-        if telegram_mgr:
-            telegram_mgr.send_message_sync(summary)
+    if all_added:
+        summary += "\n\n" + "\n".join(all_added)
+
+    def _send_summary(text: str):
+        try:
+            http_requests.post(
+                f"https://api.telegram.org/bot{telegram_mgr.token}/sendMessage",
+                json={
+                    "chat_id": telegram_mgr.manager_chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                },
+                timeout=10,
+            )
+        except Exception:
+            if telegram_mgr:
+                telegram_mgr.send_message_sync(text)
+
+    # Telegram caps messages at 4096 chars — split on line boundaries if needed
+    chunk = ""
+    for line in summary.split("\n"):
+        if chunk and len(chunk) + len(line) + 1 > 3900:
+            _send_summary(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        _send_summary(chunk)
 
 
 def run_carousel_auto_assign(telegram_mgr):

@@ -975,19 +975,24 @@ class GoOutScraper:
                         find_slugs(item)
             find_slugs(data)
 
-        # Intercept myEvents requests: bump limit to 200 and drop the
+        # Intercept myEvents requests: bump limit way up and drop the
         # activeEvents:true filter. Confirmed via live run that
         # activeEvents:true is go-out's own "tickets on sale" flag, not a
         # date-window filter — it silently excludes valid future events
         # that aren't flagged "active" yet (this was the actual cause of
         # account1 events going missing: 6 vs 140 for account2 on the same
-        # call). We still only want upcoming events, not old/ended ones,
-        # so discover_events() applies a hard past-date filter afterwards.
+        # call). But activeEvents:false alone isn't enough either — results
+        # come back oldest-first, so with a small limit the response is
+        # entirely past events and future ones never make it into the page
+        # at all (confirmed: limit=200 → 0 future events for account1).
+        # Use a much larger limit so future events actually make it into
+        # the response; discover_events() then applies a hard past-date
+        # filter to drop the old ones we don't want.
         async def route_my_events(route):
             url = route.request.url
-            new_url = re.sub(r'limit=\d+', 'limit=200', url)
+            new_url = re.sub(r'limit=\d+', 'limit=5000', url)
             if not re.search(r'[?&]limit=', new_url):
-                new_url += ('&' if '?' in new_url else '?') + 'limit=200'
+                new_url += ('&' if '?' in new_url else '?') + 'limit=5000'
             new_url = re.sub(r'%22activeEvents%22(%3A|:)true', r'%22activeEvents%22\1false', new_url)
             new_url = re.sub(r'"activeEvents"(:)true', r'"activeEvents"\1false', new_url)
             if new_url != url:

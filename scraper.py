@@ -926,6 +926,19 @@ class GoOutScraper:
         except Exception:
             pass
 
+        # Safety net: drop anything with a clearly-past date. Events with no
+        # date yet (resolved later via full scrape) are kept.
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        before = len(events)
+        events = [
+            e for e in events
+            if not e.get("date") or str(e["date"])[:10] >= today_str
+        ]
+        if len(events) != before:
+            logger.info(
+                f"[{self.account.account_id}] Dropped {before - len(events)} past-dated event(s) from discovery."
+            )
+
         logger.info(f"[{self.account.account_id}] Discovery complete. Total: {len(events)}")
         return events
 
@@ -962,12 +975,16 @@ class GoOutScraper:
                         find_slugs(item)
             find_slugs(data)
 
-        # Intercept myEvents requests and bump limit to 200 before they're sent
+        # Intercept myEvents requests and bump limit to 200 before they're sent.
+        # activeEvents is intentionally left as-is (true = future/on-sale only)
+        # since we only want upcoming events, not old/ended ones.
         async def route_my_events(route):
             url = route.request.url
             new_url = re.sub(r'limit=\d+', 'limit=200', url)
+            if not re.search(r'[?&]limit=', new_url):
+                new_url += ('&' if '?' in new_url else '?') + 'limit=200'
             if new_url != url:
-                logger.info(f"[{self.account.account_id}] Rewrote myEvents limit → 200")
+                logger.info(f"[{self.account.account_id}] Rewrote myEvents → {new_url}")
             await route.continue_(url=new_url)
 
         await self._page.route("**/myEvents**", route_my_events)
@@ -1020,6 +1037,38 @@ class GoOutScraper:
             )
         except Exception as e:
             logger.warning(f"[{self.account.account_id}] Could not ensure Events tab: {e}")
+
+        # Ensure the panel filter is set to "Active & Pending" (future/on-sale
+        # events only — NOT "All"/"Ended", we don't want old events showing up).
+        try:
+            await self._page.evaluate("""
+                () => {
+                    const triggers = Array.from(document.querySelectorAll('button, div[role="button"], select'));
+                    const filter = triggers.find(el => {
+                        const t = (el.innerText || el.value || "").toLowerCase();
+                        return t.includes("categorize") || t.includes("filter") ||
+                               t.includes("סינון") || t.includes("פעיל");
+                    });
+                    if (filter) { filter.scrollIntoView(); filter.click(); }
+                }
+            """)
+            await self._page.wait_for_timeout(1000)
+            await self._page.evaluate("""
+                () => {
+                    const opts = Array.from(document.querySelectorAll(
+                        'li, [role="option"], [role="menuitem"], option, div, button'
+                    ));
+                    const activePending = opts.find(el => {
+                        const t = (el.innerText || el.value || "").trim().toLowerCase();
+                        return t.includes("active & pending") || t.includes("active and pending") ||
+                               t === "active";
+                    });
+                    if (activePending) { activePending.scrollIntoView(); activePending.click(); }
+                }
+            """)
+            await self._page.wait_for_timeout(2000)
+        except Exception:
+            pass
 
         # Fallback scroll strategy
         last_count = 0

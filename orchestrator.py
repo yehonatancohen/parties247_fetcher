@@ -225,8 +225,10 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         for k_name, k_date, k_image in known_name_date:
             if k_date != party_date:
                 continue
-            if _name_similarity(name, k_name) >= 0.6 and name.lower() != k_name.lower():
-                return {"name": k_name, "imageUrl": k_image, "source": "approved"}
+            if name.lower() == k_name.lower():
+                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": True}
+            if _name_similarity(name, k_name) >= 0.6:
+                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": False}
 
         # Check parties already queued in this run
         if pending_coll is not None:
@@ -237,10 +239,12 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                 ):
                     pd = doc.get("party_data", {})
                     p_name = pd.get("name", "")
-                    if not p_name or p_name.lower() == name.lower():
+                    if not p_name:
                         continue
+                    if p_name.lower() == name.lower():
+                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending", "exact": True}
                     if _name_similarity(name, p_name) >= 0.6:
-                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending"}
+                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending", "exact": False}
             except Exception as exc:
                 logger.warning(f"Duplicate pending check failed: {exc}")
 
@@ -325,6 +329,13 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                 )
 
                 dup = _find_duplicate(party_data.get("name", ""), party_data.get("date", ""))
+                if dup and dup.get("exact"):
+                    logger.info(
+                        f"[{account.account_id}] Skipping exact duplicate: "
+                        f"'{party_data.get('name')}' == '{dup['name']}' ({dup['source']})"
+                    )
+                    known_parties[canonical] = dup["name"]  # avoid re-checking in same run
+                    continue
                 if dup:
                     party_data["possible_duplicate"] = dup
                     logger.info(

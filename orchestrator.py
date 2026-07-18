@@ -190,8 +190,8 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
     pending_coll = db.goout_pending if db is not None else None
 
-    # Build a URL→name lookup from the backend once for the whole scrape run
-    known_parties: dict[str, str] = {}  # normalized_url -> party name
+    # Build a URL→party lookup from the backend once for the whole scrape run
+    known_parties: dict[str, dict] = {}  # normalized_url -> {name, party_id, referralCode, url}
     # (name, date YYYY-MM-DD, imageUrl, party_id, referralCode, url) for name+date duplicate detection
     known_name_date: list[tuple[str, str, str, str, str, str]] = []
     try:
@@ -200,23 +200,25 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
             for p in resp.json():
                 name = p.get("name", "")
                 party_url = ""
+                pid = str(p.get("_id") or p.get("id") or "")
+                ref = p.get("referralCode") or ""
                 for field in ("canonicalUrl", "goOutUrl", "originalUrl"):
                     u = p.get(field)
                     if u:
-                        known_parties[normalize_url(u)] = name
+                        known_parties[normalize_url(u)] = {
+                            "name": name, "party_id": pid, "referralCode": ref, "url": u,
+                        }
                         party_url = party_url or u
                 date = (p.get("date") or "")[:10]
                 image = p.get("imageUrl") or p.get("image") or ""
-                pid = str(p.get("_id") or p.get("id") or "")
-                ref = p.get("referralCode") or ""
                 if name and date:
                     known_name_date.append((name, date, image, pid, ref, party_url))
             logger.info(f"Loaded {len(known_parties)} known party URLs from backend")
     except Exception as exc:
         logger.warning(f"Could not prefetch parties list: {exc}")
 
-    def _party_exists(canonical: str) -> str | None:
-        """Return party name if already in DB, else None."""
+    def _party_exists(canonical: str) -> dict | None:
+        """Return the known party dict if already in DB, else None."""
         return known_parties.get(canonical)
 
     def _find_duplicate(name: str, date: str) -> dict | None:
@@ -307,11 +309,27 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
                 canonical = normalize_url(event_url)
 
-                # Skip if already approved in backend
-                existing_name = _party_exists(canonical)
-                if existing_name:
+                # Skip if already approved in backend — but if this is the
+                # SAME literal event (same canonical URL) already added by
+                # a different account, and this account is account1, take
+                # ownership of it: account1 is the priority account, so its
+                # referral/hot-now attribution should win even though the
+                # party document already exists.
+                existing = _party_exists(canonical)
+                if existing:
+                    if (
+                        account.account_id == "account1"
+                        and existing.get("referralCode") != account.referral
+                        and existing.get("party_id") and existing.get("url")
+                    ):
+                        if _reattribute_to_account1(existing["party_id"], existing["url"], account):
+                            logger.info(
+                                f"[account1] Re-attributed '{existing.get('name')}' to account1 referral "
+                                f"(same URL already existed under another account)."
+                            )
+                            existing["referralCode"] = account.referral
                     if force_send and telegram_mgr:
-                        telegram_mgr.send_message_sync(f"✅ Already in DB: *{existing_name}*")
+                        telegram_mgr.send_message_sync(f"✅ Already in DB: *{existing.get('name')}*")
                     continue
 
                 # Skip if already in pending (prevents daily re-sends of unapproved parties)

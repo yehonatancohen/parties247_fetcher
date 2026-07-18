@@ -1098,6 +1098,44 @@ class GoOutScraper:
                 stable_ticks += 1
                 if stable_ticks >= 5:
                     logger.info(f"[{self.account.account_id}] Stable at {current_count} events. Done.")
+                    # Also merge in events visible in the rendered panel's own
+                    # __NEXT_DATA__ blob. The myEvents API only returns events
+                    # the account itself created — events shared with/visible
+                    # to this account (e.g. co-organizer listings) can be
+                    # rendered in the panel without ever appearing in that API
+                    # response, so relying on the API alone silently drops them.
+                    seen_ids = {e["go_out_id"] for e in api_events_found if "go_out_id" in e}
+                    try:
+                        dom_events = await self._extract_from_next_data()
+                    except Exception:
+                        dom_events = []
+                    added = 0
+                    for e in dom_events:
+                        eid = e.get("go_out_id")
+                        if eid and eid not in seen_ids:
+                            api_events_found.append(e)
+                            seen_ids.add(eid)
+                            added += 1
+                    # Also compare against the actual rendered event-ID chips
+                    # (#12345 style) in the live DOM — this reflects exactly
+                    # what the account owner visually sees in the panel,
+                    # including events shared with this account that the
+                    # myEvents API itself never returns for it.
+                    try:
+                        extra = await self._extract_by_clicking_rows(seen_ids)
+                    except Exception:
+                        extra = []
+                    for e in extra:
+                        eid = e.get("go_out_id")
+                        if eid and eid not in seen_ids:
+                            api_events_found.append(e)
+                            seen_ids.add(eid)
+                            added += 1
+                    if added:
+                        logger.info(
+                            f"[{self.account.account_id}] Merged {added} additional event(s) "
+                            f"found only in panel DOM (not in myEvents API)."
+                        )
                     return api_events_found
             else:
                 if i > 0 and i % 7 == 0:

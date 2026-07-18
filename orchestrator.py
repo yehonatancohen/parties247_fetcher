@@ -192,21 +192,25 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
     # Build a URL→name lookup from the backend once for the whole scrape run
     known_parties: dict[str, str] = {}  # normalized_url -> party name
-    # (name, date YYYY-MM-DD, imageUrl) for name+date duplicate detection
-    known_name_date: list[tuple[str, str, str]] = []
+    # (name, date YYYY-MM-DD, imageUrl, party_id, referralCode, url) for name+date duplicate detection
+    known_name_date: list[tuple[str, str, str, str, str, str]] = []
     try:
         resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
         if resp.status_code == 200:
             for p in resp.json():
                 name = p.get("name", "")
+                party_url = ""
                 for field in ("canonicalUrl", "goOutUrl", "originalUrl"):
                     u = p.get(field)
                     if u:
                         known_parties[normalize_url(u)] = name
+                        party_url = party_url or u
                 date = (p.get("date") or "")[:10]
                 image = p.get("imageUrl") or p.get("image") or ""
+                pid = str(p.get("_id") or p.get("id") or "")
+                ref = p.get("referralCode") or ""
                 if name and date:
-                    known_name_date.append((name, date, image))
+                    known_name_date.append((name, date, image, pid, ref, party_url))
             logger.info(f"Loaded {len(known_parties)} known party URLs from backend")
     except Exception as exc:
         logger.warning(f"Could not prefetch parties list: {exc}")
@@ -222,33 +226,59 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         party_date = date[:10]
 
         # Check approved parties from backend
-        for k_name, k_date, k_image in known_name_date:
+        for k_name, k_date, k_image, k_id, k_ref, k_url in known_name_date:
             if k_date != party_date:
                 continue
             if name.lower() == k_name.lower():
-                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": True}
+                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": True,
+                        "party_id": k_id, "referralCode": k_ref, "url": k_url}
             if _name_similarity(name, k_name) >= 0.6:
-                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": False}
+                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": False,
+                        "party_id": k_id, "referralCode": k_ref, "url": k_url}
 
         # Check parties already queued in this run
         if pending_coll is not None:
             try:
                 for doc in pending_coll.find(
                     {"party_data.date": {"$regex": f"^{party_date}"}},
-                    {"party_data.name": 1, "party_data.imageUrl": 1},
+                    {"party_data.name": 1, "party_data.imageUrl": 1, "party_db_id": 1},
                 ):
                     pd = doc.get("party_data", {})
                     p_name = pd.get("name", "")
                     if not p_name:
                         continue
+                    p_id = str(doc.get("party_db_id") or "")
                     if p_name.lower() == name.lower():
-                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending", "exact": True}
+                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending",
+                                "exact": True, "party_id": p_id, "referralCode": None, "url": None}
                     if _name_similarity(name, p_name) >= 0.6:
-                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending", "exact": False}
+                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending",
+                                "exact": False, "party_id": p_id, "referralCode": None, "url": None}
             except Exception as exc:
                 logger.warning(f"Duplicate pending check failed: {exc}")
 
         return None
+
+    def _reattribute_to_account1(party_id: str, base_url: str, account1: GoOutAccount) -> bool:
+        """Swap an existing party's referral/link over to account1 (priority account)."""
+        if not party_id or not base_url or not account1.referral:
+            return False
+        try:
+            headers = telegram_mgr._auth_headers()
+            parsed = urlparse(base_url.split("?ref=")[0].split("&ref=")[0])
+            qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() != "ref"]
+            qs.append(("ref", account1.referral))
+            new_url = urlunparse(parsed._replace(query=urlencode(qs)))
+            r = http_requests.put(
+                f"{config.BACKEND_URL}/api/admin/update-party/{party_id}",
+                json={"referralCode": account1.referral, "goOutUrl": new_url, "originalUrl": new_url},
+                headers=headers,
+                timeout=15,
+            )
+            return r.status_code == 200
+        except Exception as exc:
+            logger.warning(f"Failed to reattribute party {party_id} to account1: {exc}")
+            return False
 
     async def _scrape_one_account(account: GoOutAccount) -> list[str]:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)
@@ -334,6 +364,18 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                         f"[{account.account_id}] Skipping exact duplicate: "
                         f"'{party_data.get('name')}' == '{dup['name']}' ({dup['source']})"
                     )
+                    # Same event on both accounts: account1 is the priority account,
+                    # so re-attribute the existing party to it (referral + hot-now).
+                    if (
+                        account.account_id == "account1"
+                        and dup.get("source") == "approved"
+                        and dup.get("referralCode") != account.referral
+                        and dup.get("party_id") and dup.get("url")
+                    ):
+                        if _reattribute_to_account1(dup["party_id"], dup["url"], account):
+                            logger.info(
+                                f"[account1] Re-attributed '{dup['name']}' to account1 referral."
+                            )
                     known_parties[canonical] = dup["name"]  # avoid re-checking in same run
                     continue
                 if dup:

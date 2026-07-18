@@ -1,13 +1,16 @@
 """
 One-shot script to find duplicate parties (same name + same start time) and
-remove the more expensive copy, keeping the cheaper one.
+remove the extra copies.
 
 Two parties are considered duplicates when their normalized name AND full
-date/time string match exactly.
+date/time string match exactly. If a duplicate group includes an account1
+party, account1 is always kept (and re-attributed if needed) regardless of
+price, since account1 is the priority/highest-value account. Otherwise the
+cheaper ticketPrice is kept.
 
 Usage:
     python dedupe_parties.py            # dry run, just prints what would happen
-    python dedupe_parties.py --apply    # actually deletes the losing duplicates
+    python dedupe_parties.py --apply    # actually deletes/updates
 """
 import sys
 import io
@@ -20,6 +23,10 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 import config
 
 BACKEND = config.BACKEND_URL
+ACCOUNT1_REFERRAL = next(
+    (a["referral"] for a in config.GOOUT_ACCOUNTS if a["account_id"] == "account1"),
+    None,
+)
 
 
 def login() -> str:
@@ -72,13 +79,24 @@ def main():
 
     to_delete: list[dict] = []
     for (name_key, date_key), dupes in dup_groups.items():
-        dupes_sorted = sorted(dupes, key=party_price)
-        keeper = dupes_sorted[0]
-        losers = dupes_sorted[1:]
-        print(f"\n'{keeper.get('name')}' @ {date_key}")
-        print(f"  KEEP   id={keeper.get('_id') or keeper.get('id')} price={keeper.get('ticketPrice')}")
+        account1_dupes = [p for p in dupes if ACCOUNT1_REFERRAL and p.get("referralCode") == ACCOUNT1_REFERRAL]
+        if account1_dupes:
+            dupes_sorted = sorted(account1_dupes, key=party_price)
+            keeper = dupes_sorted[0]
+            losers = [p for p in dupes if p is not keeper]
+            tag = " [account1 priority]"
+        else:
+            dupes_sorted = sorted(dupes, key=party_price)
+            keeper = dupes_sorted[0]
+            losers = dupes_sorted[1:]
+            tag = ""
+
+        print(f"\n'{keeper.get('name')}' @ {date_key}{tag}")
+        print(f"  KEEP   id={keeper.get('_id') or keeper.get('id')} "
+              f"price={keeper.get('ticketPrice')} ref={keeper.get('referralCode')}")
         for l in losers:
-            print(f"  DELETE id={l.get('_id') or l.get('id')} price={l.get('ticketPrice')}")
+            print(f"  DELETE id={l.get('_id') or l.get('id')} "
+                  f"price={l.get('ticketPrice')} ref={l.get('referralCode')}")
             to_delete.append(l)
 
     if not to_delete:

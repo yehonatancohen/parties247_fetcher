@@ -666,104 +666,19 @@ class GoOutScraper:
             f"{len(api_sales)} of {before} events"
         )
 
-        # Fetch הכנסות לאירוע — discover the finance API via one page visit, then batch-fetch
-        await self._fetch_finance_revenue_parallel(api_sales)
+        # NOTE 2026-08-07: GoOut's real revenue/views endpoints (/endOne/getEventViews,
+        # /endOne/getEventStatistics/getRevenueData — keyed by the event's Mongo _id)
+        # were reverse-engineered and confirmed working from a residential browser
+        # session, but every request to them from this VPS fails with net::ERR_FAILED
+        # — reproduced identically in headless and real non-headless (Xvfb) Chromium,
+        # ruling out headless-fingerprint detection. Most likely cause: GoOut/a WAF
+        # blocking these specific endpoints by the VPS's datacenter IP reputation.
+        # ticket_price/event_revenue are left unset here rather than shipping a
+        # request path that can never succeed from this host; revisit if a
+        # non-datacenter egress (e.g. residential proxy) becomes available.
 
         logger.info(f"[{self.account.account_id}] Sales data: {len(api_sales)} events")
         return api_sales
-
-    async def _fetch_ticket_price_via_api(self, event_url_id: str, go_out_id: str) -> float | None:
-        """
-        Fetch the public event details to extract the lowest ticket price.
-        Uses the event's Url field (numeric string like "1780565778053") as identifier.
-        Returns the lowest ticket price, or None if not found.
-        """
-        if not event_url_id:
-            return None
-        api_base = "https://api.fe.prod.go-out.co"
-        url_patterns = [
-            f"{api_base}/events/{event_url_id}",
-            f"{api_base}/events/getEvent/{event_url_id}",
-            f"{api_base}/events/event/{event_url_id}",
-            f"{api_base}/events/{go_out_id}",
-        ]
-        result = await self._page.evaluate(
-            r"""
-            async (urls) => {
-                for (const url of urls) {
-                    try {
-                        const r = await fetch(url, {credentials: 'include'});
-                        if (!r.ok) continue;
-                        const ct = r.headers.get('content-type') || '';
-                        if (!ct.includes('json')) continue;
-                        const data = await r.json();
-                        const j = JSON.stringify(data);
-                        // Look for ticket price
-                        const ticketKeys = ['"Price":', '"price":', '"TicketPrice":', '"ticketPrice":', '"amount":'];
-                        for (const k of ticketKeys) {
-                            let idx = j.indexOf(k);
-                            if (idx >= 0) {
-                                const rest = j.slice(idx + k.length).trimStart();
-                                const m = rest.match(/^([\d.]+)/);
-                                if (m && parseFloat(m[1]) > 0) {
-                                    return {url, price: parseFloat(m[1]), raw: j.slice(0, 200)};
-                                }
-                            }
-                        }
-                        return {url, price: null, raw: j.slice(0, 200)};
-                    } catch(e) {}
-                }
-                return null;
-            }
-            """,
-            url_patterns,
-        )
-        if result and result.get("price"):
-            logger.info(
-                f"[{self.account.account_id}] #{go_out_id} ticket_price={result['price']} from {result['url']}"
-            )
-            return float(result["price"])
-        if result:
-            logger.debug(
-                f"[{self.account.account_id}] #{go_out_id}: API {result['url']} no price. Raw: {result.get('raw','')!r}"
-            )
-        return None
-
-    async def _fetch_finance_revenue_parallel(self, sales: list[dict]):
-        """
-        Try to fill in ticket_price for events missing it, then derive event_revenue.
-        Revenue = confirmed_tickets × ticket_price (best available proxy for salesperson accounts).
-        """
-        needs_price = [item for item in sales
-                       if item.get("ticket_price") is None
-                       and item.get("event_revenue") is None
-                       and item.get("confirmed", 0) > 0]
-        if not needs_price:
-            # Derive event_revenue from already-known ticket_price
-            for item in sales:
-                if item.get("event_revenue") is None and item.get("ticket_price") and item.get("confirmed", 0) > 0:
-                    item["event_revenue"] = item["confirmed"] * item["ticket_price"]
-            return
-
-        logger.info(
-            f"[{self.account.account_id}] Fetching ticket prices for {len(needs_price)} events..."
-        )
-        for item in needs_price:
-            gid = item["go_out_id"]
-            url_id = item.get("event_url_id", "")
-            price = await self._fetch_ticket_price_via_api(url_id, gid)
-            if price is not None:
-                item["ticket_price"] = price
-
-        # Derive event_revenue from ticket_price × confirmed
-        for item in sales:
-            if item.get("event_revenue") is None and item.get("ticket_price") and item.get("confirmed", 0) > 0:
-                item["event_revenue"] = item["confirmed"] * item["ticket_price"]
-
-        found = sum(1 for item in sales if item.get("event_revenue") is not None)
-        logger.info(
-            f"[{self.account.account_id}] Revenue derived for {found}/{len(sales)} events"
-        )
 
     async def _scrape_sales_from_dom(self) -> list[dict]:
         """

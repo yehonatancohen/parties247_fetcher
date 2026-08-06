@@ -133,12 +133,27 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
             if existing:
                 prev_confirmed      = existing.get("confirmed_count", 0)
                 prev_event_revenue  = existing.get("event_revenue")
-                # Reuse the price stored on first encounter (buyer paid that price)
-                stored_price        = existing.get("ticket_price") or live_price
+                # Reuse the price stored on first encounter (buyer paid that price).
+                # `is not None` (not `or`) so a legitimately free ticket (₪0) isn't
+                # discarded in favor of a re-fetched live_price.
+                existing_price      = existing.get("ticket_price")
+                stored_price        = existing_price if existing_price is not None else live_price
             else:
                 prev_confirmed     = 0
                 prev_event_revenue = None
                 stored_price       = live_price
+
+            # Guard against a transient scrape glitch reading 0 (or a lower count)
+            # for an event that previously had real confirmed sales — trusting it
+            # would both log a false "-N" delta now and a spurious "+N" delta next
+            # run when the real count reappears (double-charging account1's flat fee).
+            if confirmed_now < prev_confirmed:
+                logger.warning(
+                    f"[{account.account_id}] {event_name or go_out_id}: confirmed count "
+                    f"regressed {prev_confirmed} → {confirmed_now}, treating as a transient "
+                    f"read and keeping the previous snapshot value"
+                )
+                confirmed_now = prev_confirmed
 
             delta_confirmed     = confirmed_now - prev_confirmed
             delta_event_revenue = None

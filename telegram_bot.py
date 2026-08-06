@@ -1292,7 +1292,7 @@ class TelegramManager:
                 return None
             goout_url = doc.get("goOutUrl") or doc.get("party_data", {}).get("goOutUrl")
             if goout_url:
-                parties_coll = self._db.client["party247"].parties if self._db is not None else None
+                parties_coll = self._db.parties if self._db is not None else None
                 party = parties_coll.find_one({"goOutUrl": goout_url}, {"_id": 1}) if parties_coll else None
                 if party:
                     return str(party["_id"])

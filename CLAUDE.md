@@ -144,6 +144,13 @@ edit-session, text is parsed as a JSON party-field-overrides object.
   delta. For an event with real revenue history before it had a `goOutEventId`/was first joined,
   this over-credits account2 with 6% of the event's *lifetime* revenue in one 4-hour window.
   Worth checking if account2's numbers ever look implausibly high right after a backfill.
+- **`ticket_price`/`event_revenue` are currently always `null` — no working data source.**
+  Confirmed/pending ticket counts (`confirmed_count`/`pending_count` in `goout_sales`) *are*
+  real and reliable (from the `myEvents` API + DOM merge). But every account currently earns
+  ₪0 in practice, since there is no working price/revenue source — see "Fixed 2026-08-07" below
+  for what was tried and ruled out. Don't re-attempt the `api.fe.prod.go-out.co` URL-guessing
+  approach that used to live in `_fetch_ticket_price_via_api` — confirmed dead (0/522 stored
+  events ever got a price via it before removal).
 
 ## Carousel logic (`carousel_suggester.py`)
 
@@ -165,9 +172,9 @@ Ranked roughly by how much they'd affect reliability or data accuracy:
    progress.
 3. **10-minute 2FA blocking window with no escalation** if nobody answers Telegram in time —
    the account just silently fails for that day.
-4. **Ticket price/revenue is approximated**, not exact, especially for account2 (flat pricing
-   assumption ignores multiple ticket tiers actually sold; revenue-calc method can silently
-   switch between "real gross revenue" and "confirmed × price × 6%" run to run).
+4. **Ticket price/revenue has no working data source at all** (not merely approximated —
+   see "Fixed 2026-08-07" below). account1's flat fee and account2's percentage both
+   currently compute to ₪0 for every event, even though confirmed-ticket counts are real.
 5. **First-run revenue-delta over-attribution** described above.
 6. **JWT re-fetched per call** in `telegram_bot.py` — not a correctness bug, but adds needless
    backend load/latency on every admin action.
@@ -185,3 +192,36 @@ Ranked roughly by how much they'd affect reliability or data accuracy:
   to `self._db.parties`.
 - `.env.example`'s comment claimed `GOOUT_SCRAPE_HOUR` defaults to 8; `config.py`'s actual
   default is 6. Comment corrected.
+
+## Fixed 2026-08-07 (this pass)
+
+- `sales_tracker.py`: guarded against a transient confirmed-count regression (a bad scrape
+  reading 0 for an event that previously had real sales would both log a false negative delta
+  *and* cause a spurious double-charge next run when the real count reappeared).
+- `sales_tracker.py`: stopped discarding a legitimately free (₪0) stored `ticket_price` in
+  favor of a re-fetch (falsy-zero `or` bug — `existing.get("ticket_price") or live_price`).
+- `scraper.py`: removed `_fetch_ticket_price_via_api`/`_fetch_finance_revenue_parallel` — the
+  guessed `api.fe.prod.go-out.co` URL patterns never actually worked in production.
+
+**Revenue/views investigation (not solved).** GoOut's real per-event data lives at
+`POST www.go-out.co/endOne/getEventViews` and `POST www.go-out.co/endOne/getEventStatistics/
+getRevenueData`, both keyed by the event's Mongo `_id` (`obj["_id"]` in the `myEvents`
+response — *not* `EventSerial` or `Url`). Confirmed working from a real residential-IP browser
+session (₪420 revenue, 12 views, matched the panel UI exactly). But every call to these
+specific endpoints from the VPS fails with `net::ERR_FAILED`/`TypeError: Failed to fetch`,
+and each of the following was tested directly and ruled out as the cause:
+- Headless Chromium fingerprinting (tested real non-headless Chromium via Xvfb — still fails)
+- Cross-origin/CORS or cookie-domain mismatch between `go-out.co` and `www.go-out.co` (redirect
+  and cookie scoping both confirmed correct; the app's own frontend makes this exact
+  cross-origin call successfully)
+- Missing a required call sequence (tested calling `eventManagement/initialEvent` first, like
+  the real page does on navigation — still fails, including `initialEvent` itself)
+
+Remaining likely causes: IP-reputation blocking of the VPS's datacenter IP, or deeper
+automation fingerprinting (e.g. Cloudflare detecting the CDP protocol Playwright uses to drive
+the browser, which persists regardless of headless state). Both need materially more
+investment than the rest of this fix (a residential proxy, or a non-CDP automation approach)
+— don't re-attempt Xvfb/headless-spoofing tricks without new evidence, both were tested and
+don't help. `mongo_id` extraction and the `/endOne` call code were removed rather than left as
+a non-functional dead path; if revisited, the endpoints/payloads/response shapes documented
+above are already correct and tested.

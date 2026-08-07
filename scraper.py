@@ -548,9 +548,10 @@ class GoOutScraper:
         # no longer new. One extra direct API call — myEvents itself isn't blocked
         # from this VPS, only the endOne/* endpoints are (see cf-relay/README.md).
         original_my_events_url: str | None = None
+        rewritten_my_events_url: str | None = None
 
         async def route_my_events_sales(route):
-            nonlocal original_my_events_url
+            nonlocal original_my_events_url, rewritten_my_events_url
             url = route.request.url
             # The page's own first request is activeEvents:true, untouched — capture
             # it once before we rewrite anything, so it can be replayed later.
@@ -566,6 +567,8 @@ class GoOutScraper:
             # The colon may or may not be URL-encoded (%3A vs :)
             new_url = re.sub(r'%22activeEvents%22(%3A|:)true', r'%22activeEvents%22\1false', new_url)
             new_url = re.sub(r'"activeEvents"(:)true', r'"activeEvents"\1false', new_url)
+            if rewritten_my_events_url is None:
+                rewritten_my_events_url = new_url
             if new_url != url:
                 logger.info(f"[{self.account.account_id}] Rewrote myEvents → {new_url}")
             await route.continue_(url=new_url)
@@ -707,6 +710,43 @@ class GoOutScraper:
                         )
             except Exception as exc:
                 logger.debug(f"[{self.account.account_id}] activeEvents:true replay failed: {exc}")
+
+        # Paginate past the first 500-item page. The organizer panel's own API caps
+        # each response at `limit=500`, and its scroll-based UI only ever issues one
+        # page's worth of requests for this filtered view (confirmed 2026-08-07: DOM
+        # chip count stabilizes at ~499-500 even though the account has ~1500 events
+        # total). Events sitting past the first page in whatever order GoOut returns
+        # them — which skews toward far-future events, since near-term/active events
+        # sort first — were silently never scraped at all, regardless of the
+        # extraction-guard fix above. Walk skip=500,1000,... for both activeEvents
+        # modes until a page adds no new distinct events, capped to bound worst-case
+        # runtime.
+        for base_url, label in ((rewritten_my_events_url, "activeEvents:false"), (original_my_events_url, "activeEvents:true")):
+            if not base_url:
+                continue
+            skip = 500
+            while skip <= 3000:
+                page_url = re.sub(r'([?&]skip=)\d+', rf'\g<1>{skip}', base_url)
+                if page_url == base_url:
+                    break  # no skip param to bump — bail rather than loop forever
+                try:
+                    resp = await self._context.request.get(page_url, timeout=20000)
+                    if not resp.ok:
+                        break
+                    page_data = await resp.json()
+                except Exception as exc:
+                    logger.debug(f"[{self.account.account_id}] Page skip={skip} ({label}) fetch failed: {exc}")
+                    break
+                before_page = len(api_sales)
+                _walk_for_sales(page_data)
+                added = len(api_sales) - before_page
+                if added == 0:
+                    break
+                logger.info(
+                    f"[{self.account.account_id}] Page skip={skip} ({label}): "
+                    f"+{added} new events (total {len(api_sales)})"
+                )
+                skip += 500
 
         # Keep events from the last 30 days backwards AND all future events.
         # Lower bound drops stale completed events; no upper bound so upcoming

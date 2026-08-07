@@ -16,8 +16,11 @@ Not on Vercel/Render — this is the one service that lives entirely on the VPS 
 - `daily_goout_scrape` — cron, `GOOUT_SCRAPE_HOUR:00 UTC` (env-configurable, **actual default
   is 6**, not 8 — the comment in `.env.example` was wrong until this doc pass; fixed there too).
   Calls `run_daily_scrape(accounts, db, telegram_mgr, force_send=False)`.
-- `sales_update` — interval, every 4 hours (fires once at scheduler start, then every 4h from
-  then — not aligned to clock hours). Calls `run_sales_update(accounts, db, telegram_mgr)`.
+- `sales_update` — interval, every 4 hours, `next_run_time` forced to fire immediately on
+  scheduler start (fixed 2026-08-07 — APScheduler's default for an `IntervalTrigger` with no
+  `start_date` is start+interval, *not* immediately; confirmed via VPS logs showing a ~4h gap
+  between scheduler start and the first sales-related log line). Not aligned to clock hours.
+  Calls `run_sales_update(accounts, db, telegram_mgr)`.
 
 Both are also triggerable manually from Telegram (`/scrape [account_id]`, `/sales_update`).
 
@@ -225,3 +228,35 @@ investment than the rest of this fix (a residential proxy, or a non-CDP automati
 don't help. `mongo_id` extraction and the `/endOne` call code were removed rather than left as
 a non-functional dead path; if revisited, the endpoints/payloads/response shapes documented
 above are already correct and tested.
+
+## Fixed 2026-08-07 (second pass — "41 sales in 7 days" was false, active events never tracked)
+
+Two real, evidenced bugs found and fixed after the user reported the dashboard showing 41
+GoOut sales in the last 7 days (actual 7-day delta from `goout_sales_log` was 5) and sales only
+ever appearing to register once an event had already ended:
+
+1. **`scraper.py::scrape_sales_data()` silently dropped every currently-active event.** The
+   30-day trailing date filter (`item.get("event_date") and item["event_date"] >= cutoff`)
+   treated a *missing* `event_date` as "stale" and dropped the item — but a missing date more
+   often means date extraction (API `StartingDate` / DOM row-text regex) simply failed for that
+   item, which happens disproportionately for still-active events. A direct query of
+   `goout_sales` confirmed every single event with `confirmed_count > 0` had a **past** party
+   date — zero exceptions — which is exactly what you'd see if active events never got
+   tracked until they ended and a fuller payload (with a working date) became available. Fixed
+   to only drop items with a *known* stale date, not an unknown one. This was the real cause of
+   "sales only counted once the party goes active→inactive."
+2. **`parties247_backend/app.py::build_party_funnel()` reported lifetime totals as if they were
+   within the requested day window.** `purchases`/`revenue` were sourced from
+   `build_sales_by_party()`, which aggregates `goout_sales_log` with no date filter at all
+   (genuinely intended as an all-time summary for a different endpoint). The funnel's `views`/
+   `redirects` *were* correctly filtered to `days`, so the two numbers were never comparable —
+   "41 sales in the last 7 days" was actually all-time confirmed tickets across every tracked
+   event. Fixed by adding `_sales_totals_by_event_id(cutoff)` and using it with the funnel's
+   own cutoff instead of the lifetime helper.
+3. **`main.py`'s `sales_update` job didn't fire immediately on scheduler start** (see above) —
+   compounds bug #1's effect after every redeploy.
+
+Not fixed this pass (need live investigation, not a code read — see project memory
+`project_goout_revenue_views_blocker`): whether a per-order/participant endpoint with a real
+purchase timestamp exists (would replace `recorded_at` = "time we noticed" with the real sale
+time), and the VPS-only `net::ERR_FAILED` on the revenue/views endpoints.

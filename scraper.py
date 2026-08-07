@@ -653,13 +653,24 @@ class GoOutScraper:
         # Keep events from the last 30 days backwards AND all future events.
         # Lower bound drops stale completed events; no upper bound so upcoming
         # parties with pre-sold tickets are always included.
+        #
+        # IMPORTANT: an item with no event_date is *not* evidence it's stale —
+        # it means date extraction (API StartingDate / DOM row-text regex)
+        # failed for that item, which happens disproportionately for still-
+        # active events (their panel row/API payload doesn't always carry a
+        # cleanly parseable date the way an ended event's does). Dropping
+        # those items here used to silently exclude active events from sales
+        # tracking entirely until they ended and a fuller payload appeared —
+        # which looked like "sales are only counted once an event ends" and
+        # meant tickets sold days earlier were only ever logged in one lump
+        # at end-of-event. Only drop items with a *known* stale date.
         _now = datetime.now(timezone.utc)
         _d_start = (_now - timedelta(days=30)).date()
         _range_s = str(_d_start)
         before = len(api_sales)
         api_sales = [
             item for item in api_sales
-            if item.get("event_date") and item["event_date"] >= _range_s
+            if not item.get("event_date") or item["event_date"] >= _range_s
         ]
         logger.info(
             f"[{self.account.account_id}] Date filter {_range_s}..future: "

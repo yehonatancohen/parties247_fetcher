@@ -7,6 +7,7 @@ Starts:
 """
 
 import logging
+from datetime import datetime
 
 import pymongo
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -67,13 +68,17 @@ def main():
         id="daily_goout_scrape",
         replace_existing=True,
     )
-    # Sales data update every 4 hours (tracks confirmed/pending tickets and revenue)
+    # Sales data update every 4 hours (tracks confirmed/pending tickets and revenue).
+    # next_run_time=now forces the first run immediately instead of APScheduler's
+    # default (start + interval) — without this, every redeploy/restart opens a
+    # ~4h blind window before sales are checked again.
     scheduler.add_job(
         func=lambda: run_sales_update(accounts, db, telegram_mgr),
         trigger="interval",
         hours=4,
         id="sales_update",
         replace_existing=True,
+        next_run_time=datetime.now(),
     )
     scheduler.start()
     logger.info(

@@ -17,7 +17,11 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import requests as http_requests
+
+import config
 from scraper import GoOutScraper, GoOutAccount
+from orchestrator import reattribute_party_to_account1
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +101,82 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
             telegram_mgr.send_message_sync(msg)
         except Exception as exc:
             logger.error(f"Failed to send sales summary to Telegram: {exc}")
+
+    _reconcile_dual_account_referrals(accounts, db, telegram_mgr)
+
+
+def _reconcile_dual_account_referrals(accounts: list[GoOutAccount], db, telegram_mgr=None):
+    """
+    Safety net for orchestrator.py's discovery-time reattribution: when the same
+    GoOut event is visible to (and tracked by) both accounts, the live party on
+    the site must carry account1's referral/hot-now attribution, never account2's
+    — even if account2 discovered/created it first. Discovery already tries to
+    fix this the moment it re-encounters the event in that day's active-event
+    list, but that only works while the event is still upcoming; if discovery
+    never got the chance (URL/name-date matching gap, or the event went inactive
+    first), the wrong referral sticks forever. Sales tracking, unlike discovery,
+    already computes go_out_id/account overlap every cycle regardless of whether
+    the event is still active — so it can catch and fix what discovery missed.
+
+    Confirmed live 2026-08-07: 10 of 51 dual-tracked events had the wrong
+    (account2) referral, all past events discovery would never revisit.
+    """
+    if db is None or telegram_mgr is None:
+        return
+    account1 = next((a for a in accounts if a.account_id == "account1"), None)
+    if not account1 or not account1.referral:
+        return
+
+    try:
+        pipeline = [
+            {"$group": {"_id": "$go_out_id", "accounts": {"$addToSet": "$account_id"}}},
+            {"$match": {"accounts": "account1"}},
+        ]
+        dual_go_out_ids = {
+            str(row["_id"]) for row in db.goout_sales.aggregate(pipeline)
+            if len(row.get("accounts") or []) > 1
+        }
+    except Exception as exc:
+        logger.warning(f"Dual-account referral reconciliation: aggregation failed: {exc}")
+        return
+    if not dual_go_out_ids:
+        return
+
+    try:
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
+        resp.raise_for_status()
+        parties = resp.json()
+    except Exception as exc:
+        logger.warning(f"Dual-account referral reconciliation: could not fetch parties: {exc}")
+        return
+
+    fixed = []
+    for party in parties:
+        event_id = party.get("goOutEventId")
+        if event_id is None or str(event_id) not in dual_go_out_ids:
+            continue
+        if party.get("referralCode") == account1.referral:
+            continue
+        party_id = str(party.get("_id") or party.get("id") or "")
+        base_url = party.get("originalUrl") or party.get("goOutUrl") or party.get("canonicalUrl")
+        if not party_id or not base_url:
+            continue
+        if reattribute_party_to_account1(
+            party_id, base_url, account1.referral, telegram_mgr._auth_headers()
+        ):
+            fixed.append(party.get("name") or party_id)
+            logger.info(f"[reconcile] Re-attributed '{party.get('name')}' to account1 referral.")
+
+    if fixed:
+        try:
+            names = "\n".join(f"  • {n}" for n in fixed[:15])
+            more = f"\n  …and {len(fixed) - 15} more" if len(fixed) > 15 else ""
+            telegram_mgr.send_message_sync(
+                f"🔀 *Fixed referral attribution* — {len(fixed)} dual-tracked event(s) "
+                f"were showing account2's link, now on account1:\n{names}{more}"
+            )
+        except Exception as exc:
+            logger.error(f"Failed to send reconciliation summary to Telegram: {exc}")
 
 
 async def _update_account(account: GoOutAccount, db, telegram_mgr=None):

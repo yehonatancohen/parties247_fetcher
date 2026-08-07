@@ -166,6 +166,35 @@ def _is_test_event(name: str) -> bool:
     return any(indicator in name_lower for indicator in _TEST_INDICATORS)
 
 
+def reattribute_party_to_account1(party_id: str, base_url: str, account1_referral: str, auth_headers: dict) -> bool:
+    """Swap an existing party's referral/link over to account1 (the priority account).
+
+    Shared between discovery (this module) and sales_tracker.py's reconciliation
+    pass — the same event can be tracked by both accounts, and only discovery's
+    daily event list catches a mismatch the moment it happens; sales tracking
+    runs this same fix every 4h as a safety net for events discovery missed
+    (URL/name-date matching gaps, or the event going inactive before discovery
+    got a chance to reattribute it).
+    """
+    if not party_id or not base_url or not account1_referral:
+        return False
+    try:
+        parsed = urlparse(base_url.split("?ref=")[0].split("&ref=")[0])
+        qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() != "ref"]
+        qs.append(("ref", account1_referral))
+        new_url = urlunparse(parsed._replace(query=urlencode(qs)))
+        r = http_requests.put(
+            f"{config.BACKEND_URL}/api/admin/update-party/{party_id}",
+            json={"referralCode": account1_referral, "goOutUrl": new_url, "originalUrl": new_url},
+            headers=auth_headers,
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception as exc:
+        logger.warning(f"Failed to reattribute party {party_id} to account1: {exc}")
+        return False
+
+
 def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
     """Synchronous entry point for the daily scrape job."""
     loop = asyncio.new_event_loop()
@@ -262,25 +291,9 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         return None
 
     def _reattribute_to_account1(party_id: str, base_url: str, account1: GoOutAccount) -> bool:
-        """Swap an existing party's referral/link over to account1 (priority account)."""
-        if not party_id or not base_url or not account1.referral:
-            return False
-        try:
-            headers = telegram_mgr._auth_headers()
-            parsed = urlparse(base_url.split("?ref=")[0].split("&ref=")[0])
-            qs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() != "ref"]
-            qs.append(("ref", account1.referral))
-            new_url = urlunparse(parsed._replace(query=urlencode(qs)))
-            r = http_requests.put(
-                f"{config.BACKEND_URL}/api/admin/update-party/{party_id}",
-                json={"referralCode": account1.referral, "goOutUrl": new_url, "originalUrl": new_url},
-                headers=headers,
-                timeout=15,
-            )
-            return r.status_code == 200
-        except Exception as exc:
-            logger.warning(f"Failed to reattribute party {party_id} to account1: {exc}")
-            return False
+        return reattribute_party_to_account1(
+            party_id, base_url, account1.referral, telegram_mgr._auth_headers()
+        )
 
     async def _scrape_one_account(account: GoOutAccount) -> list[str]:
         scraper = GoOutScraper(account, db=db, telegram_mgr=telegram_mgr)

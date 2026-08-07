@@ -124,7 +124,22 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
             confirmed_now      = int(item.get("confirmed")     or 0)
             pending_now        = int(item.get("pending")       or 0)
             live_price         = item.get("ticket_price")
-            live_event_revenue = item.get("event_revenue")  # הכנסות לאירוע
+
+            # Extra per-event stats pulled via the cf-relay Worker (views, real revenue
+            # breakdown, per-date sales, buyer list, expenses, ...) — see
+            # scraper.py::_fetch_endone_stats / cf-relay/README.md. Optional: empty dict
+            # when CF_RELAY_URL isn't configured or every endpoint failed for this event.
+            endone_stats = item.get("endone_stats") or {}
+            views = (endone_stats.get("views") or {}).get("Views")
+            real_revenue = (endone_stats.get("revenue") or {}).get("revenue") or {}
+
+            # הכנסות לאירוע ("event_revenue") from the myEvents API is a dead field —
+            # always null in practice, see goout-scraper/CLAUDE.md. The real, working
+            # revenue source is GoOut's own endOne/getRevenueData own_revenue (a
+            # cumulative counter, same shape as confirmed ticket counts) — prefer it.
+            live_event_revenue = item.get("event_revenue")
+            if live_event_revenue is None:
+                live_event_revenue = real_revenue.get("own_revenue")
 
             existing = sales_coll.find_one(
                 {"account_id": account.account_id, "go_out_id": go_out_id}
@@ -160,8 +175,16 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
             if live_event_revenue is not None and prev_event_revenue is not None:
                 delta_event_revenue = live_event_revenue - prev_event_revenue
             elif live_event_revenue is not None and prev_event_revenue is None:
-                # First time we see the revenue field — treat full amount as this period's delta
-                delta_event_revenue = live_event_revenue
+                if existing is not None:
+                    # We've tracked this event before but this is the first poll where
+                    # real revenue data became available (e.g. this deploy) — treat it
+                    # as establishing a baseline, not a lump-sum "sale" of the event's
+                    # entire revenue history in one 4h window.
+                    delta_event_revenue = 0.0
+                else:
+                    # Genuinely new event, first time seen at all — same lump-sum
+                    # convention already used for delta_confirmed above.
+                    delta_event_revenue = live_event_revenue
 
             # Only log when something actually changed
             has_change = delta_confirmed > 0 or (delta_event_revenue is not None and delta_event_revenue > 0)
@@ -192,14 +215,6 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     "delta_event_revenue": delta_event_revenue,
                     "revenue_earned":      rev,
                 })
-
-            # Extra per-event stats pulled via the cf-relay Worker (views, real revenue
-            # breakdown, per-date sales, buyer list, expenses, ...) — see
-            # scraper.py::_fetch_endone_stats / cf-relay/README.md. Optional: empty dict
-            # when CF_RELAY_URL isn't configured or every endpoint failed for this event.
-            endone_stats = item.get("endone_stats") or {}
-            views = (endone_stats.get("views") or {}).get("Views")
-            real_revenue = (endone_stats.get("revenue") or {}).get("revenue") or {}
 
             # Upsert the latest snapshot
             sales_coll.update_one(

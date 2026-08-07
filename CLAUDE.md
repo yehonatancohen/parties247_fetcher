@@ -259,6 +259,42 @@ real):
   `eventManagement/lastDayData`, `eventManagement/finnacialSummary`, `eventManagement/
   getSeatsManager`.
 
+## Fixed 2026-08-07 (fourth pass — dead revenue field, team-member events silently stuck)
+
+Two more bugs found the same day, from a user report that active parties showed real GoOut
+purchase-clicks but 0 GoOut views, and that "revenue" was showing GoOut's own number instead
+of our commission calculation:
+
+1. **`sales_tracker.py`'s revenue delta pipeline was fed a field that's always null.**
+   `live_event_revenue = item.get("event_revenue")` (הכנסות לאירוע from the myEvents API) is
+   dead — confirmed always `None` across all 535 tracked events. `_calc_revenue()`'s account2
+   6%-of-revenue branch therefore always fell through to the `ticket_price × delta_confirmed`
+   fallback, which was *also* always null (ticket_price never populated either — see "Known
+   sharp edges" above), so account2 always earned ₪0 despite real ticket sales happening.
+   Fixed: `live_event_revenue` now falls back to the real `own_revenue` figure from
+   `endone_stats` (GoOut's own endOne/getRevenueData, confirmed non-zero and consistent with
+   ticket counts — e.g. 8 confirmed tickets → ₪910) when `event_revenue` is null. Reuses the
+   existing delta-per-poll machinery already built for ticket counts — no new collection
+   needed. Guarded the known "first-time-seeing-revenue" lump-sum behavior so *already-tracked*
+   events don't get their entire historical `own_revenue` attributed as one 4h period's revenue
+   the moment this fix deploys (only genuinely brand-new events get the lump-sum, same as
+   `delta_confirmed` always has).
+2. **Sales scraping's `activeEvents:false` rewrite silently drops team-member/co-organizer
+   events forever, not just temporarily.** `discover_events()` already documents (see
+   "Scraping mechanics" above) that `activeEvents:false` "switches to a different query mode
+   that returns only events this account itself *owns*, silently dropping team-member events."
+   `scrape_sales_data()` forces this rewrite unconditionally for every event, including still-
+   upcoming ones — so a team/co-organizer event that was discovered fine (discovery uses
+   `activeEvents:true`) simply never appears in any subsequent sales-tracking cycle again.
+   Confirmed in production: an active event dated 12+ days out had 15 real site redirect-
+   clicks but a `goout_sales` doc frozen 2+ days stale with no `endone_stats` at all — i.e.
+   permanently invisible to sales/views tracking despite being live on the site. Fixed by
+   capturing the page's own natural (untouched, `activeEvents:true`) myEvents request URL and
+   replaying it directly via `context.request.get()` after the main false-mode scroll/DOM pass,
+   merging any recovered events into the same `api_sales` list (already dedup-merges by
+   `go_out_id`). One extra direct API call — myEvents itself isn't blocked from the VPS, only
+   `endOne/*` is.
+
 ## Fixed 2026-08-07 (third pass — revenue/views blocker actually solved)
 
 The VPS-only block on `www.go-out.co/endOne/*` (documented above and in project memory

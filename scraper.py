@@ -527,9 +527,27 @@ class GoOutScraper:
 
         self._page.on("response", _intercept_sales)
 
-        # Rewrite myEvents API requests: bump limit and remove activeEvents:true filter
+        # Rewrite myEvents API requests: bump limit and remove activeEvents:true filter.
+        # activeEvents:false is needed to include ended events, but (see
+        # discover_events()'s route_my_events below) it also switches to a query mode
+        # that silently drops team-member/co-organizer events — the exact opposite
+        # trade-off from discovery. We capture the original (untouched, activeEvents:
+        # true) URL here and replay it directly after the scroll/DOM pass below, so
+        # team events don't just vanish from sales/views tracking the moment they're
+        # no longer new. One extra direct API call — myEvents itself isn't blocked
+        # from this VPS, only the endOne/* endpoints are (see cf-relay/README.md).
+        original_my_events_url: str | None = None
+
         async def route_my_events_sales(route):
+            nonlocal original_my_events_url
             url = route.request.url
+            # The page's own first request is activeEvents:true, untouched — capture
+            # it once before we rewrite anything, so it can be replayed later.
+            if original_my_events_url is None:
+                bumped = re.sub(r'(limit=)\d+', r'\g<1>500', url)
+                if not re.search(r'[?&]limit=', bumped):
+                    bumped += ('&' if '?' in bumped else '?') + 'limit=500'
+                original_my_events_url = bumped
             new_url = re.sub(r'(limit=)\d+', r'\g<1>500', url)
             if not re.search(r'[?&]limit=', new_url):
                 new_url += ('&' if '?' in new_url else '?') + 'limit=500'
@@ -657,6 +675,27 @@ class GoOutScraper:
 
         if not api_sales and dom_sales:
             api_sales = dom_sales
+
+        # Recover team-member/co-organizer events dropped by the activeEvents:false
+        # rewrite above (see comment on route_my_events_sales). Confirmed missing in
+        # production: events still visible on the site (found during discovery, which
+        # uses activeEvents:true) but frozen with no sales/views updates for days
+        # because they never appear in this scrape's activeEvents:false event list.
+        if original_my_events_url:
+            try:
+                resp = await self._context.request.get(original_my_events_url, timeout=20000)
+                if resp.ok:
+                    true_mode_data = await resp.json()
+                    before_recover = len(api_sales)
+                    _walk_for_sales(true_mode_data)
+                    recovered = len(api_sales) - before_recover
+                    if recovered:
+                        logger.info(
+                            f"[{self.account.account_id}] Recovered {recovered} team-member "
+                            "event(s) missing from the activeEvents:false sales scrape"
+                        )
+            except Exception as exc:
+                logger.debug(f"[{self.account.account_id}] activeEvents:true replay failed: {exc}")
 
         # Keep events from the last 30 days backwards AND all future events.
         # Lower bound drops stale completed events; no upper bound so upcoming

@@ -275,10 +275,22 @@ of our commission calculation:
    `endone_stats` (GoOut's own endOne/getRevenueData, confirmed non-zero and consistent with
    ticket counts — e.g. 8 confirmed tickets → ₪910) when `event_revenue` is null. Reuses the
    existing delta-per-poll machinery already built for ticket counts — no new collection
-   needed. Guarded the known "first-time-seeing-revenue" lump-sum behavior so *already-tracked*
-   events don't get their entire historical `own_revenue` attributed as one 4h period's revenue
-   the moment this fix deploys (only genuinely brand-new events get the lump-sum, same as
-   `delta_confirmed` always has).
+   needed.
+
+   First shipped with a guard that zeroed the "first time seeing revenue" delta (to avoid
+   attributing an event's whole historical revenue to one 4h window) — this was wrong and
+   reverted same day: the very first (guarded) run already wrote the real `own_revenue` value
+   into each doc's `event_revenue` field with a 0 logged delta, which permanently erased that
+   revenue — the *next* run then saw `prev == live` (no change) and logged nothing either,
+   since there was no "first sight" moment left. Reverted to the same lump-sum-on-first-sight
+   convention `delta_confirmed` already uses (documented risk, not a new one). The already-
+   contaminated docs from the guarded run needed a one-time manual backfill (10 `goout_sales_log`
+   entries, `"backfill": true`, ₪151.25 total for account2 — account1 is unaffected since its
+   flat-fee revenue never depended on `event_revenue`) to recover the lost delta; script was not
+   kept, pattern is straightforward to reproduce if this class of bug recurs: for any
+   `goout_sales` doc with `event_revenue > 0` and no existing `goout_sales_log` entry with a
+   nonzero `delta_event_revenue` for that `(account_id, go_out_id)`, insert one now with
+   `delta_event_revenue = event_revenue` (the full current value).
 2. **Sales scraping's `activeEvents:false` rewrite silently drops team-member/co-organizer
    events forever, not just temporarily.** `discover_events()` already documents (see
    "Scraping mechanics" above) that `activeEvents:false` "switches to a different query mode

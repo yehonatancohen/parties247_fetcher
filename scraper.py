@@ -728,24 +728,26 @@ class GoOutScraper:
             while skip <= 3000:
                 page_url = re.sub(r'([?&]skip=)\d+', rf'\g<1>{skip}', base_url)
                 if page_url == base_url:
+                    logger.info(f"[{self.account.account_id}] Pagination ({label}): no skip= param in URL, stopping")
                     break  # no skip param to bump — bail rather than loop forever
                 try:
                     resp = await self._context.request.get(page_url, timeout=20000)
                     if not resp.ok:
+                        logger.info(f"[{self.account.account_id}] Pagination skip={skip} ({label}): HTTP {resp.status}")
                         break
                     page_data = await resp.json()
                 except Exception as exc:
-                    logger.debug(f"[{self.account.account_id}] Page skip={skip} ({label}) fetch failed: {exc}")
+                    logger.info(f"[{self.account.account_id}] Pagination skip={skip} ({label}) fetch failed: {exc}")
                     break
                 before_page = len(api_sales)
                 _walk_for_sales(page_data)
                 added = len(api_sales) - before_page
-                if added == 0:
-                    break
                 logger.info(
-                    f"[{self.account.account_id}] Page skip={skip} ({label}): "
+                    f"[{self.account.account_id}] Pagination skip={skip} ({label}): "
                     f"+{added} new events (total {len(api_sales)})"
                 )
+                if added == 0:
+                    break
                 skip += 500
 
         # Keep events from the last 30 days backwards AND all future events.

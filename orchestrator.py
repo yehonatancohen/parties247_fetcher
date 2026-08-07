@@ -21,6 +21,7 @@ import config
 from utils import normalize_url, normalized_or_none_for_dedupe, apply_default_referral, slugify_party
 from scraper import GoOutScraper, GoOutAccount
 from carousel_suggester import suggest_carousel_assignments, suggest_carousels_for_party
+from dedupe_parties import run_dedupe
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,30 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
 
     run_hot_now_update(accounts, db, telegram_mgr)
     run_carousel_auto_assign(telegram_mgr)
+    run_dedupe_pass(telegram_mgr)
+
+
+def run_dedupe_pass(telegram_mgr):
+    """
+    Auto-merge duplicate party listings (same name+date scraped as separate
+    GoOut events — confirmed to happen, e.g. "Revival Summer Festival
+    13-14.8" existed as 3 separate listings splitting real revenue/traffic
+    three ways, 2026-08-07). Runs every daily scrape now instead of staying
+    a manual one-shot script, so duplicates don't accumulate between runs.
+    Best-effort: any failure here must not affect the rest of the daily
+    scrape, which has already completed by this point.
+    """
+    try:
+        result = run_dedupe(apply=True, log=logger.info)
+        if telegram_mgr and result.get("deleted"):
+            telegram_mgr.send_message_sync(
+                f"🧹 Dedup: merged {result['deleted']} duplicate part(y/ies) "
+                f"across {result['groups']} group(s), redirected to survivors."
+            )
+    except Exception as exc:
+        logger.error(f"Dedupe pass failed: {exc}")
+        if telegram_mgr:
+            telegram_mgr.send_message_sync(f"⚠️ Dedupe pass failed: {exc}")
 
 
 async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):

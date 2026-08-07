@@ -24,10 +24,12 @@ Not on Vercel/Render — this is the one service that lives entirely on the VPS 
 
 Both are also triggerable manually from Telegram (`/scrape [account_id]`, `/sales_update`).
 
-The maintenance scripts (`dedupe_parties.py`, `backfill_goout_event_id.py`,
-`cleanup_hot_now.py`) are **manual one-shot CLI tools only** — not scheduled, not wired to the
-bot. Run by hand with `python <script>.py [--apply]` (dry-run by default except
-`cleanup_hot_now.py`, which prompts interactively instead — not safe for unattended use).
+The maintenance scripts (`backfill_goout_event_id.py`, `cleanup_hot_now.py`) are **manual
+one-shot CLI tools only** — not scheduled, not wired to the bot. Run by hand with
+`python <script>.py [--apply]` (dry-run by default except `cleanup_hot_now.py`, which prompts
+interactively instead — not safe for unattended use). `dedupe_parties.py` is the exception as
+of 2026-08-07 — see "Fixed 2026-08-07 (sixth pass)" below, it's now also wired into the daily
+scrape via `orchestrator.py::run_dedupe_pass`, though it can still be run standalone too.
 
 ## Daily scrape flow (`orchestrator.py::run_daily_scrape`)
 
@@ -184,6 +186,38 @@ Ranked roughly by how much they'd affect reliability or data accuracy:
 7. **`scratch/` debug dumps never cleaned up.**
 8. **`API_PORT` config var is dead** (read, never used) — harmless but confusing; likely
    copy-pasted from another service's `.env`.
+
+## Fixed 2026-08-07 (sixth pass — duplicate GoOut listings fragmenting revenue/SEO)
+
+Found while running `/seo-update` with its new revenue-optimization scope: the same
+real-world event sometimes gets scraped as **multiple separate GoOut listings** (different
+`goOutEventId`s, not just a DB glitch — confirmed via `/api/parties`, 7 duplicate name+date
+groups found in one pass). Worst case: "Revival Summer Festival 13-14.8" existed as 3
+separate listings across 2 site URLs, splitting a real-earning event's traffic/SEO signal
+and sales tracking three ways — one listing had actual ticket sales (₪38.28), the other two
+had zero, yet the fuzzy duplicate check in `orchestrator.py::_find_duplicate` only *flags*,
+never blocks, so all three got auto-approved as separate parties.
+
+`dedupe_parties.py` already existed as a manual one-shot fix for this exact case, but had two
+gaps closed this pass:
+1. **No redirect on delete** — it just called `DELETE /api/admin/delete-party/<id>`, leaving
+   the dead slug 404ing and losing any accumulated SEO/traffic signal. Fixed: the endpoint now
+   accepts an optional `redirectTo=<keeper-slug>` and records the mapping in a new
+   `party_redirects` Mongo collection (`parties247_backend/app.py`); `parties247-website`'s
+   `proxy.ts` checks the new public `GET /api/redirects/<slug>` endpoint on a 404 and serves a
+   308 to the survivor instead of a dead link.
+2. **Wrong tiebreaker** — when no account1 duplicate existed, it kept the *cheapest*
+   `ticketPrice`, which in the Revival case would have deleted the already-earning listing in
+   favor of a zero-revenue one. Fixed: now keeps whichever duplicate has the most real revenue
+   (`/api/admin/analytics/sales`, our commission figure), falling back to cheapest price only
+   when revenue is tied/zero on all candidates. account1 still always wins over account2
+   duplicates regardless of revenue, per the site's stated revenue-priority order.
+
+Also refactored `main()` into an importable `run_dedupe(apply, log)` and wired it into
+`orchestrator.py::run_daily_scrape` (new `run_dedupe_pass`, runs after `run_hot_now_update`/
+`run_carousel_auto_assign`, best-effort — a failure here doesn't affect the rest of the day's
+scrape, which has already completed by that point) — so duplicates get caught and redirected
+automatically every day instead of needing someone to remember to run the script by hand.
 
 ## Fixed 2026-08-06 (this pass)
 

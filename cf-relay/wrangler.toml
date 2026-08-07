@@ -1,0 +1,4 @@
+name = "goout-relay-test"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+account_id = "4f52492ac247390986bd5d8807f89a1b"

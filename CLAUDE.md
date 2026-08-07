@@ -229,6 +229,71 @@ don't help. `mongo_id` extraction and the `/endOne` call code were removed rathe
 a non-functional dead path; if revisited, the endpoints/payloads/response shapes documented
 above are already correct and tested.
 
+**Endpoint discovery, round 2 (2026-08-07, via claude-in-chrome on the user's real logged-in
+browser — no VPS/2FA involved).** All confirmed live and working under `www.go-out.co/endOne/`
+by patching `fetch`/`XMLHttpRequest` in-page and clicking into a real event. Same domain as
+above — still blocked from the VPS, this only expands what's *available* once that's solved.
+Response shapes (captured on a zero-sales event, so mostly empty/zero, but field names are
+real):
+- `getEventViews` → `{"status":true,"Views":2,"mediaViews":{}}` — `Views` is the real page-view
+  counter shown in the panel's "מידע כללי" tab.
+- `getEventStatistics/getRevenueData` → `{"revenue":{"total_revenue":0,"own_revenue":0,
+  "own_table_revenue":0,"total_table_revenue":0,"own_amount_of_sales":0,
+  "total_amount_of_sales":0}}`.
+- `getEventStatistics/SalesPerDate` → `{"dates":{},"dates_pending":{},"dates_rejected":{}}` —
+  **not previously known.** `dates` is (from the key names) almost certainly a dict keyed by
+  calendar date with a per-day sold count — i.e. GoOut's own server-side record of *which day*
+  each ticket sold, independent of when we happened to poll. If the shape holds on an event with
+  real sales, this replaces the need to infer sale timing from our own snapshot-diff deltas
+  entirely — it would directly fix the "sold long time ago, counted just now" timestamp problem
+  documented above, no residential proxy workaround needed for *this specific* piece, just for
+  getting the VPS able to reach `www.go-out.co/endOne/` at all.
+- `getXLastAcceptedUsers` → `{"status":false,"users":[]}` on this event (0 sales, hence
+  `status:false`). Strongly implied by the name to be the actual **buyer list** — exactly what
+  was asked for (who bought, when). Not yet confirmed non-empty; need to capture it on an event
+  with real accepted tickets to see the per-user shape (name/timestamp/price fields).
+- `getUserTicketStatistics` → `{"Accepted":0,"Pending":0,"Rejected":0,"Abandoned":0,
+  "TableAccepted":0,"TablePending":0,"TableRejected":0,"Total":0,"TotalTables":0,"Failed":0}`.
+- `getXLeadingSalesman` → per-salesperson breakdown (`own_amount_of_sales`, role, join date).
+- Also seen but not inspected: `getTotalExpenses`, `getTopTickets`, `loadEventTicketsTest`,
+  `eventManagement/lastDayData`, `eventManagement/finnacialSummary`, `eventManagement/
+  getSeatsManager`.
+
+## Fixed 2026-08-07 (third pass — revenue/views blocker actually solved)
+
+The VPS-only block on `www.go-out.co/endOne/*` (documented above and in project memory
+`project_goout_revenue_views_blocker` since 2026-08-07) is resolved, not just further
+investigated. Solution: a Cloudflare Worker relay (`cf-relay/`) — `www.go-out.co` is itself
+Cloudflare-fronted (confirmed via its own `/cdn-cgi/rum` beacon), and routing these specific
+calls through Cloudflare's network instead of directly from the VPS's Oracle datacenter IP gets
+a normal `200` instead of `net::ERR_FAILED`. No residential proxy purchase needed. Full
+rationale, deploy steps, and secret-rotation instructions: `cf-relay/README.md`.
+
+Second bug found and fixed in the same pass: the relay calls were silently returning
+`{"status":false}` even with cookies passed through, because **GoOut's panel doesn't use a
+session cookie at all** — `context.cookies()` on a fully authenticated session contains only
+marketing/analytics cookies (Stripe, TikTok, GA, `AWSALB`, etc.), no auth cookie. The real
+session lives as a JWT in `localStorage.user.token`, sent as `Authorization: Bearer <token>`.
+Once `scraper.py::_auth_header()` was added to read that and pass it through as `x-relay-auth`,
+every endpoint started returning real data instead of `status:false`.
+
+`scraper.py::scrape_sales_data()` now calls `_fetch_endone_stats()` for every event that has a
+`mongo_id` (captured for free from the `myEvents` response — no extra lookup), pulling all ten
+known `/endOne/*` fields per event with one retry each. Stored on the sales item as
+`endone_stats`, and `sales_tracker.py` writes it (plus flattened `views`/`real_total_revenue`/
+`real_own_revenue` convenience fields) onto each `goout_sales` document.
+
+**Timing, measured locally 2026-08-07:** ~1.1–1.2s per event for the full 10-endpoint pass
+(sequential, 0.3s pause between events). Account1 (22 events after the date filter): ~26s.
+Account2 (227 events): ~4.5 min. Both accounts scrape concurrently in production
+(`asyncio.gather` in `sales_tracker.py`), so a real 4-hour cycle costs roughly the larger of the
+two — comfortably inside the 4h interval, no parallelization needed.
+
+Not yet seen populated with real data (every event tested so far had zero actual ticket sales,
+so these come back as legitimate empty/false rather than broken): `getXLastAcceptedUsers`
+(the real buyer list), `getTotalExpenses`, `getTopTickets`, `eventManagement/finnacialSummary`.
+Worth spot-checking their shape once an event with real sales gets scraped.
+
 ## Fixed 2026-08-07 (second pass — "41 sales in 7 days" was false, active events never tracked)
 
 Two real, evidenced bugs found and fixed after the user reported the dashboard showing 41

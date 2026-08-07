@@ -193,6 +193,14 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     "revenue_earned":      rev,
                 })
 
+            # Extra per-event stats pulled via the cf-relay Worker (views, real revenue
+            # breakdown, per-date sales, buyer list, expenses, ...) — see
+            # scraper.py::_fetch_endone_stats / cf-relay/README.md. Optional: empty dict
+            # when CF_RELAY_URL isn't configured or every endpoint failed for this event.
+            endone_stats = item.get("endone_stats") or {}
+            views = (endone_stats.get("views") or {}).get("Views")
+            real_revenue = (endone_stats.get("revenue") or {}).get("revenue") or {}
+
             # Upsert the latest snapshot
             sales_coll.update_one(
                 {"account_id": account.account_id, "go_out_id": go_out_id},
@@ -205,6 +213,12 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     "ticket_price":    stored_price,
                     "event_revenue":   live_event_revenue,
                     "last_updated":    now,
+                    # Real per-event data from www.go-out.co/endOne/* (via cf-relay) —
+                    # separate from the fields above, which come from the myEvents API.
+                    "views":              views,
+                    "real_total_revenue": real_revenue.get("total_revenue"),
+                    "real_own_revenue":   real_revenue.get("own_revenue"),
+                    "endone_stats":       endone_stats,
                 }},
                 upsert=True,
             )

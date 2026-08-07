@@ -15,6 +15,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
+import config
+
 logger = logging.getLogger(__name__)
 
 GO_OUT_BASE = "https://www.go-out.co"
@@ -379,6 +381,9 @@ class GoOutScraper:
                 return
             eid = str(eid)
 
+            # Mongo _id — the key the endOne/* stats endpoints need (see cf-relay/README.md).
+            mongo_id = obj.get("_id")
+
             # statistics sub-object: {"Accepted": N, "Pending": N, "Today": N, "Rejected": N}
             stats = obj.get("statistics") or obj.get("Statistics") or {}
             if not isinstance(stats, dict):
@@ -477,6 +482,8 @@ class GoOutScraper:
                     existing["event_date"] = event_date
                 if event_url_id and not existing.get("event_url_id"):
                     existing["event_url_id"] = event_url_id
+                if mongo_id and not existing.get("mongo_id"):
+                    existing["mongo_id"] = str(mongo_id)
             else:
                 api_sales.append({
                     "go_out_id":     eid,
@@ -487,6 +494,7 @@ class GoOutScraper:
                     "event_revenue": event_revenue,
                     "event_date":    event_date,
                     "event_url_id":  event_url_id,
+                    "mongo_id":      str(mongo_id) if mongo_id else None,
                 })
 
         def _walk_for_sales(data, depth=0):
@@ -677,19 +685,111 @@ class GoOutScraper:
             f"{len(api_sales)} of {before} events"
         )
 
-        # NOTE 2026-08-07: GoOut's real revenue/views endpoints (/endOne/getEventViews,
-        # /endOne/getEventStatistics/getRevenueData — keyed by the event's Mongo _id)
-        # were reverse-engineered and confirmed working from a residential browser
-        # session, but every request to them from this VPS fails with net::ERR_FAILED
-        # — reproduced identically in headless and real non-headless (Xvfb) Chromium,
-        # ruling out headless-fingerprint detection. Most likely cause: GoOut/a WAF
-        # blocking these specific endpoints by the VPS's datacenter IP reputation.
-        # ticket_price/event_revenue are left unset here rather than shipping a
-        # request path that can never succeed from this host; revisit if a
-        # non-datacenter egress (e.g. residential proxy) becomes available.
+        # NOTE 2026-08-07: GoOut's real per-event data (/endOne/*: views, revenue,
+        # sales-per-date, buyer list, expenses, etc.) is blocked with net::ERR_FAILED
+        # when called directly from this VPS's datacenter IP — but works when routed
+        # through a Cloudflare Worker relay instead (www.go-out.co is itself
+        # Cloudflare-fronted). See cf-relay/README.md for why/how. Fetched below for
+        # every event that made it through the date filter, using each event's own
+        # mongo _id (already captured above, no extra lookup needed).
+        if config.CF_RELAY_URL and config.CF_RELAY_SECRET:
+            cookie_header = await self._cookie_header()
+            auth_header = await self._auth_header()
+            for item in api_sales:
+                mongo_id = item.get("mongo_id")
+                if not mongo_id:
+                    continue
+                extras = await self._fetch_endone_stats(mongo_id, cookie_header, auth_header)
+                if extras:
+                    item["endone_stats"] = extras
+                await asyncio.sleep(0.3)
+        else:
+            logger.info(
+                f"[{self.account.account_id}] CF_RELAY_URL/CF_RELAY_SECRET not configured — "
+                "skipping views/revenue/sales-per-date extra-stats scraping."
+            )
 
         logger.info(f"[{self.account.account_id}] Sales data: {len(api_sales)} events")
         return api_sales
+
+    async def _cookie_header(self) -> str:
+        """Format this session's go-out.co cookies as a `name=value; ...` header string,
+        for passing through the cf-relay Worker so it authenticates as this account."""
+        try:
+            cookies = await self._context.cookies()
+        except Exception:
+            return ""
+        parts = [f"{c['name']}={c['value']}" for c in cookies if "go-out.co" in c.get("domain", "")]
+        return "; ".join(parts)
+
+    async def _auth_header(self) -> str:
+        """The endOne/* stats endpoints authenticate via a JWT in localStorage
+        (`user.token`), NOT cookies — GoOut's panel carries no session cookie at all,
+        only marketing/analytics ones. Confirmed 2026-08-07: cookie-only calls through
+        the relay silently return {"status":false}; adding `Authorization: Bearer
+        <token>` is what makes them return real data. Returns "" if unavailable."""
+        try:
+            user_json = await self._page.evaluate("() => localStorage.getItem('user')")
+            if not user_json:
+                return ""
+            token = json.loads(user_json).get("token")
+            return f"Bearer {token}" if token else ""
+        except Exception:
+            return ""
+
+    # Endpoint -> (relay path, extra body fields beyond {"eventId": mongo_id})
+    _ENDONE_STATS_ENDPOINTS = {
+        "views":            ("getEventViews", {}),
+        "ticket_stats":     ("getUserTicketStatistics/", {}),
+        "revenue":          ("getEventStatistics/getRevenueData", {}),
+        "sales_per_date":   ("getEventStatistics/SalesPerDate", {}),
+        "leading_salesman": ("getXLeadingSalesman", {"numberOfUsers": 10}),
+        "last_accepted":    ("getXLastAcceptedUsers", {"numberOfUsers": 25}),
+        "expenses":         ("getTotalExpenses", {}),
+        "top_tickets":      ("getTopTickets", {}),
+        "last_day":         ("eventManagement/lastDayData", {}),
+        "financial_summary":("eventManagement/finnacialSummary", {}),
+    }
+
+    async def _fetch_endone_stats(self, mongo_id: str, cookie_header: str, auth_header: str) -> dict:
+        """Pull every known www.go-out.co/endOne/* stat for one event via the cf-relay
+        Worker (direct calls from this VPS fail — see cf-relay/README.md). Best-effort:
+        a failure on one endpoint doesn't block the others. One retry per endpoint —
+        occasional single-endpoint failures under rapid sequential calls were observed
+        to be transient (Worker cold-start/rate jitter), not systematic."""
+        results: dict = {}
+        for field, (path, extra_body) in self._ENDONE_STATS_ENDPOINTS.items():
+            target = f"{GO_OUT_BASE}/endOne/{path}"
+            body = {"eventId": mongo_id, **extra_body}
+            for attempt in range(2):
+                try:
+                    resp = await self._context.request.post(
+                        config.CF_RELAY_URL,
+                        params={"target": target},
+                        headers={
+                            "x-relay-secret": config.CF_RELAY_SECRET,
+                            "x-relay-cookie": cookie_header,
+                            "x-relay-auth": auth_header,
+                            "content-type": "application/json",
+                        },
+                        data=json.dumps(body),
+                        timeout=15000,
+                    )
+                    if resp.ok:
+                        results[field] = await resp.json()
+                        break
+                    logger.debug(
+                        f"[{self.account.account_id}] endOne/{path} for {mongo_id}: "
+                        f"HTTP {resp.status} (attempt {attempt + 1})"
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"[{self.account.account_id}] endOne/{path} for {mongo_id} "
+                        f"failed (attempt {attempt + 1}): {exc}"
+                    )
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+        return results
 
     async def _scrape_sales_from_dom(self) -> list[dict]:
         """

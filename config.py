@@ -35,3 +35,8 @@ for _idx in ("1", "2"):
 
 GOOUT_SCRAPE_HOUR: int = int(os.environ.get("GOOUT_SCRAPE_HOUR", "6"))
 API_PORT: int = int(os.environ.get("API_PORT", "5001"))
+
+# Cloudflare Worker relay for www.go-out.co/endOne/* (views/revenue/etc — blocked directly
+# from this VPS). See cf-relay/README.md. Optional: if unset, extra-stats scraping is skipped.
+CF_RELAY_URL: str = os.environ.get("CF_RELAY_URL", "")
+CF_RELAY_SECRET: str = os.environ.get("CF_RELAY_SECRET", "")

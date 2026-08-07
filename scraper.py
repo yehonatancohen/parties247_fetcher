@@ -690,6 +690,18 @@ class GoOutScraper:
         if not api_sales and dom_sales:
             api_sales = dom_sales
 
+        # Both the team-member replay and the pagination below make out-of-band
+        # requests via self._context.request.get() instead of going through the
+        # page's own routed fetch/XHR machinery -- which means they need the same
+        # Authorization: Bearer <JWT> header _auth_header() already established is
+        # required for endOne/* (see its docstring: GoOut's panel carries no session
+        # cookie, only marketing/analytics ones). Confirmed 2026-08-07: without this
+        # header every one of these calls returns 401 and is silently swallowed
+        # (bare `if resp.ok` / debug-level exception logging never surfaced it) --
+        # meaning team-member recovery has likely never actually recovered anything.
+        _auth = await self._auth_header()
+        _extra_headers = {"Authorization": _auth} if _auth else {}
+
         # Recover team-member/co-organizer events dropped by the activeEvents:false
         # rewrite above (see comment on route_my_events_sales). Confirmed missing in
         # production: events still visible on the site (found during discovery, which
@@ -697,7 +709,7 @@ class GoOutScraper:
         # because they never appear in this scrape's activeEvents:false event list.
         if original_my_events_url:
             try:
-                resp = await self._context.request.get(original_my_events_url, timeout=20000)
+                resp = await self._context.request.get(original_my_events_url, headers=_extra_headers, timeout=20000)
                 if resp.ok:
                     true_mode_data = await resp.json()
                     before_recover = len(api_sales)
@@ -708,8 +720,10 @@ class GoOutScraper:
                             f"[{self.account.account_id}] Recovered {recovered} team-member "
                             "event(s) missing from the activeEvents:false sales scrape"
                         )
+                else:
+                    logger.info(f"[{self.account.account_id}] activeEvents:true replay: HTTP {resp.status}")
             except Exception as exc:
-                logger.debug(f"[{self.account.account_id}] activeEvents:true replay failed: {exc}")
+                logger.info(f"[{self.account.account_id}] activeEvents:true replay failed: {exc}")
 
         # Paginate past the first 500-item page. The organizer panel's own API caps
         # each response at `limit=500`, and its scroll-based UI only ever issues one
@@ -731,7 +745,7 @@ class GoOutScraper:
                     logger.info(f"[{self.account.account_id}] Pagination ({label}): no skip= param in URL, stopping")
                     break  # no skip param to bump — bail rather than loop forever
                 try:
-                    resp = await self._context.request.get(page_url, timeout=20000)
+                    resp = await self._context.request.get(page_url, headers=_extra_headers, timeout=20000)
                     if not resp.ok:
                         logger.info(f"[{self.account.account_id}] Pagination skip={skip} ({label}): HTTP {resp.status}")
                         break

@@ -259,7 +259,29 @@ real):
   `eventManagement/lastDayData`, `eventManagement/finnacialSummary`, `eventManagement/
   getSeatsManager`.
 
-## Fixed 2026-08-07 (fourth pass — dead revenue field, team-member events silently stuck)
+## Fixed 2026-08-07 (fifth pass — 139 of 145 active/future parties never scanned for sales at all)
+
+User reported knowing about real ticket sales on currently-active parties that weren't showing
+anywhere in the dashboard. Confirmed far worse than a display bug: **139 of 145 future-dated
+parties with a `goOutEventId` had zero `goout_sales` document at all** — not stale, not zeroed,
+literally never created — across *both* accounts (account1: 10/10 missing, account2: 129/135
+missing), so purchases on those events were invisible however far back you queried. Every
+`goout_sales` doc with real `confirmed_count > 0` was for a party whose date had already passed.
+
+Root cause: `scraper.py::_extract_sales_from_obj()` dropped any object lacking all four of
+confirmed/pending/event_revenue/event_date, on the theory that a bare `EventSerial` with nothing
+else was probably an irrelevant nested object caught by the recursive JSON walk. Wrong in
+practice — GoOut's `myEvents` payload for an event still weeks away frequently omits these
+fields entirely (they populate as the event nears), so a real, valid event was silently
+discarded instead of getting a `confirmed=0` baseline doc that later scrapes would update as
+real data appeared. Fixed: keep any object with a valid `EventSerial` and a name/title (a real
+`EventSerial` is already strong evidence of a genuine event; requiring a name filters actual
+noise). Not yet verified whether this alone fully closes the gap for the small number of
+future events dated many months out (2027-03-25 was among the missing set) — worth spot-
+checking again after a few scrape cycles; if some are still missing, the `myEvents` request's
+`limit=500` cap combined with total event volume per account (some near/over 500) is the next
+suspect, since sort order for `activeEvents:false` isn't confirmed to put far-future events
+within that cap.
 
 Two more bugs found the same day, from a user report that active parties showed real GoOut
 purchase-clicks but 0 GoOut views, and that "revenue" was showing GoOut's own number instead

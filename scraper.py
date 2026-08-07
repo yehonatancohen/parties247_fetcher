@@ -443,10 +443,21 @@ class GoOutScraper:
                         pass
                     break
 
-            if confirmed is None and pending is None and event_revenue is None and event_date is None:
-                return
-
             name = obj.get("Title") or obj.get("Name") or obj.get("name") or obj.get("title")
+
+            # Previously required at least one of confirmed/pending/event_revenue/
+            # event_date to be present, on the theory that a bare EventSerial with
+            # nothing else was probably an irrelevant nested object. Confirmed wrong
+            # in production 2026-08-07: 139 of 145 currently-active/future parties
+            # (across both accounts) had *zero* goout_sales entry at all, because
+            # GoOut's myEvents payload for an event that's still weeks away often
+            # doesn't carry these fields yet (they populate as the event nears) --
+            # so this guard silently dropped the event outright instead of just
+            # creating a confirmed=0 baseline that later scrapes would update. A
+            # real EventSerial is already strong enough evidence this is a genuine
+            # event object; requiring a name too filters out any actual noise.
+            if not name:
+                return
 
             # Lowest active ticket price
             price = None

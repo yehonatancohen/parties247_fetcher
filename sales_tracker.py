@@ -175,16 +175,14 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
             if live_event_revenue is not None and prev_event_revenue is not None:
                 delta_event_revenue = live_event_revenue - prev_event_revenue
             elif live_event_revenue is not None and prev_event_revenue is None:
-                if existing is not None:
-                    # We've tracked this event before but this is the first poll where
-                    # real revenue data became available (e.g. this deploy) — treat it
-                    # as establishing a baseline, not a lump-sum "sale" of the event's
-                    # entire revenue history in one 4h window.
-                    delta_event_revenue = 0.0
-                else:
-                    # Genuinely new event, first time seen at all — same lump-sum
-                    # convention already used for delta_confirmed above.
-                    delta_event_revenue = live_event_revenue
+                # First time real revenue data is available for this event (either a
+                # brand-new event, or an existing one seeing its own_revenue populated
+                # for the first time after the 2026-08-07 fix). Treat the full amount
+                # as this period's delta — same lump-sum convention already used for
+                # delta_confirmed above. This is real money that was never tracked
+                # before, not a spurious spike; the alternative (baselining to 0) would
+                # permanently lose every ticket sold before this fix shipped.
+                delta_event_revenue = live_event_revenue
 
             # Only log when something actually changed
             has_change = delta_confirmed > 0 or (delta_event_revenue is not None and delta_event_revenue > 0)

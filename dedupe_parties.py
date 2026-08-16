@@ -1,21 +1,36 @@
 """
-One-shot script to find duplicate parties (same name + same start time) and
-remove the extra copies, redirecting the dead slug(s) to the survivor.
+One-shot script to find duplicate parties (same real-world event listed
+twice) and remove the extra copies, redirecting the dead slug(s) to the
+survivor.
 
-Two parties are considered duplicates when their normalized name AND full
-date/time string match exactly (this catches the same real-world event
-listed twice under different GoOut event IDs — confirmed to happen when a
-promoter re-lists an event, e.g. "Revival Summer Festival 13-14.8" existed
-as three separate GoOut listings, 2026-08-07). If a duplicate group includes
-an account1 party, account1 is always kept regardless of revenue/price,
-since account1 is the priority/highest-value account (flat-fee, easiest to
-convert — see .claude/commands/seo-update.md in the workspace root for the
-revenue-priority rationale this mirrors). Otherwise, the party with the most
-real revenue (from /api/admin/analytics/sales) is kept — NOT the cheapest
-price as before 2026-08-07: keeping the cheapest listing would have deleted
-an already-earning duplicate in favor of a zero-revenue one, exactly
-backwards for revenue purposes. Price is only a fallback tiebreaker when
-neither has any recorded revenue.
+Two parties are considered duplicates when they share a fuzzy grouping key:
+the name's brand prefix (everything before the first digit, emoji/punctuation
+stripped) plus the calendar day of the party's date. This catches the same
+real-world event listed twice under different GoOut event IDs — confirmed to
+happen both as one-off re-listings (e.g. "Revival Summer Festival 13-14.8"
+existed as three separate GoOut listings, 2026-08-07) AND, found 2026-08-17,
+as a *recurring weekly* pattern: "THURSDAY MOON | MAINSTREAM | 06.08" vs
+"THURSDAY MOON | MAINSTREAM | 6.8 🏝️" are the same Thursday event ~30 minutes
+apart, but an exact (normalized_name, date_string) match never caught them —
+the date embedded in the name uses a different format (06.08 vs 6.8) and one
+copy has an emoji suffix, so the strings never matched even though they're
+clearly the same event happening the same week. The fuzzy key group-matches
+by day instead, so this keeps working for every future week of the series
+without a one-off fix. Names whose brand prefix is too short/generic (e.g.
+just punctuation, common for Hebrew titles that start with a number) fall
+back to the original exact (name, date) key instead, to avoid over-merging
+unrelated same-day events that happen to share no real prefix.
+
+If a duplicate group includes an account1 party, account1 is always kept
+regardless of revenue/price, since account1 is the priority/highest-value
+account (flat-fee, easiest to convert — see .claude/commands/seo-update.md in
+the workspace root for the revenue-priority rationale this mirrors).
+Otherwise, the party with the most real revenue (from
+/api/admin/analytics/sales) is kept — NOT the cheapest price as before
+2026-08-07: keeping the cheapest listing would have deleted an already-
+earning duplicate in favor of a zero-revenue one, exactly backwards for
+revenue purposes. Price is only a fallback tiebreaker when neither has any
+recorded revenue.
 
 Every deleted party's slug is redirected to the keeper's slug via
 DELETE /api/admin/delete-party/<id>?redirectTo=<keeper-slug> so the dead
@@ -82,6 +97,54 @@ def normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
 
 
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "\U0000FE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+_PUNCT_RE = re.compile(r"[|:\-/.,!*?\"'()]+")
+
+
+def brand_prefix(name: str) -> str:
+    """Everything before the first digit, emoji/punctuation stripped, for
+    fuzzy-grouping recurring events whose name embeds a differently-formatted
+    date (see module docstring)."""
+    name = _EMOJI_RE.sub("", name or "")
+    match = re.match(r"^([^0-9]+)", name)
+    prefix = match.group(1) if match else name
+    prefix = _PUNCT_RE.sub(" ", prefix)
+    return re.sub(r"\s+", " ", prefix).strip().upper()
+
+
+def calendar_day(date_str: str) -> str:
+    """Date-only portion (YYYY-MM-DD) of a party's date string, for grouping
+    same-day listings whose times differ slightly (e.g. 22:30 vs 23:00)."""
+    return (date_str or "")[:10]
+
+
+def dedupe_key(party: dict) -> tuple[str, str] | None:
+    """Fuzzy (brand_prefix, calendar_day) key when the prefix has enough real
+    content to be meaningful; otherwise falls back to the original exact
+    (normalized_name, full_date_string) key so generic/punctuation-only
+    prefixes (common for Hebrew titles starting with a number) don't
+    over-merge unrelated same-day events."""
+    name_key = normalize_name(party.get("name", ""))
+    date_key = (party.get("date") or "").strip()
+    if not name_key or not date_key:
+        return None
+
+    prefix = brand_prefix(party.get("name", ""))
+    if len(re.sub(r"\s+", "", prefix)) >= 3:
+        return ("fuzzy", prefix, calendar_day(date_key))
+    return ("exact", name_key, date_key)
+
+
 def party_price(p: dict) -> float:
     price = p.get("ticketPrice")
     return price if isinstance(price, (int, float)) else float("inf")
@@ -126,18 +189,17 @@ def run_dedupe(apply: bool, log=print) -> dict:
         pid = p.get("_id") or p.get("id")
         if not pid:
             continue
-        name_key = normalize_name(p.get("name", ""))
-        date_key = (p.get("date") or "").strip()
-        if not name_key or not date_key:
+        key = dedupe_key(p)
+        if key is None:
             continue
-        groups.setdefault((name_key, date_key), []).append(p)
+        groups.setdefault(key, []).append(p)
 
     dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
     log(f"  {len(dup_groups)} duplicate group(s) found "
         f"({sum(len(v) for v in dup_groups.values())} parties involved)")
 
     to_delete: list[tuple[dict, dict]] = []  # (loser, keeper)
-    for (name_key, date_key), dupes in dup_groups.items():
+    for group_key, dupes in dup_groups.items():
         account1_dupes = [p for p in dupes if ACCOUNT1_REFERRAL and p.get("referralCode") == ACCOUNT1_REFERRAL]
         if account1_dupes:
             # account1 always wins regardless of revenue/price — it's the
@@ -151,7 +213,7 @@ def run_dedupe(apply: bool, log=print) -> dict:
         keeper = best_by_revenue_then_price(candidates, revenue_by_slug)
         losers = [p for p in dupes if p is not keeper]
 
-        log(f"\n'{keeper.get('name')}' @ {date_key}{tag}")
+        log(f"\n'{keeper.get('name')}' @ {group_key}{tag}")
         log(f"  KEEP   id={keeper.get('_id') or keeper.get('id')} slug={keeper.get('slug')} "
             f"revenue={party_revenue(keeper, revenue_by_slug)} price={keeper.get('ticketPrice')} "
             f"ref={keeper.get('referralCode')}")

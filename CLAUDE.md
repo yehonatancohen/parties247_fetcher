@@ -165,6 +165,28 @@ renaming a carousel changes what it auto-matches. `LOCATION_DAYS_CAP = 60`: city
 pull in parties within 60 days. The "חם עכשיו" (Hot Now) carousel is explicitly excluded from
 this keyword logic — it's exclusively managed by `run_hot_now_update`'s full-replace rebuild.
 
+## Added 2026-09-07 — alerts, CAPTCHA bail-out, best-sellers carousel, unit tests
+
+- `alerts.py` (pure, no `config` import): `detect_captcha(html)` recognises *rendered*
+  challenges (Cloudflare interstitial/turnstile, hCaptcha/reCAPTCHA iframes) but not a bare
+  reCAPTCHA `<script>` include; `discovery_alert(account, found, previous)` fires on 0
+  events with any baseline, or a ≥80% drop from a baseline ≥10. Baseline lives in the
+  account's `goout_sessions` doc (`last_discovery_count`, only updated by non-zero runs so a
+  dark account keeps alerting daily). `should_send_captcha_alert` throttles to one Telegram
+  alert per account per 12h (`last_captcha_alert_at`).
+- `scraper.py::_abort_if_captcha(stage)` runs on the login page *before* the 2FA
+  availability ask and again after submit — closes sharp edge #2 (endless daily 2FA pings).
+- `orchestrator.py`: discovery-count check right after `discover_events()` (sharp edge #1);
+  new `run_best_sellers_update` — exact full-replace of the "הכי נמכרים 🔥" carousel with
+  upcoming parties ranked by **our commission** in `goout_sales_log` over the last 14 days
+  (`best_sellers.py::rank_best_sellers`; ties → tickets → account1 first). Creates the
+  carousel on first run. Runs after `run_hot_now_update` in the daily scrape and after every
+  4h sales update (`main.py::_sales_job`). `carousel_suggester` skips this carousel like it
+  skips Hot Now — its title must never contain the temporal keywords ("שבוע", "עכשיו").
+- `tests/` + `pytest.ini` (`testpaths = tests`, so the live `test_sales.py` script is not
+  collected). Run with `.venv/bin/python -m pytest`. Pure modules only; nothing here needs
+  env vars, GoOut, Mongo or Telegram.
+
 ## Known sharp edges / candidates for the "improve scraping" effort
 
 Ranked roughly by how much they'd affect reliability or data accuracy:

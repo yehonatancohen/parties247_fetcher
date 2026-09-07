@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import config
+from alerts import captcha_message, detect_captcha, should_send_captcha_alert
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,28 @@ class GoOutScraper:
             logger.warning(f"[{self.account.account_id}] Login check failed: {exc}")
             return False
 
+    async def _abort_if_captcha(self, stage: str) -> bool:
+        """
+        True (and login must stop) when the current page is a bot challenge.
+        Previously a challenge read as a plain "login failed" and re-triggered the
+        Telegram 2FA relay every single run; now it alerts once per 12h and bails
+        before the relay is ever asked.
+        """
+        try:
+            marker = detect_captcha(await self._page.content())
+        except Exception:
+            return False
+        if not marker:
+            return False
+        logger.error(f"[{self.account.account_id}] Bot challenge detected ({marker}) at {stage}; aborting login.")
+        self._mark_session_invalid()
+        if self._telegram and should_send_captcha_alert(self._db, self.account.account_id):
+            try:
+                self._telegram.send_message_sync(captcha_message(self.account.account_id, marker, stage))
+            except Exception as exc:
+                logger.warning(f"[{self.account.account_id}] Could not send CAPTCHA alert: {exc}")
+        return True
+
     async def _perform_login(self) -> bool:
         logger.info(f"[{self.account.account_id}] Navigating to login page...")
         try:
@@ -204,6 +227,9 @@ class GoOutScraper:
             await self._page.wait_for_timeout(2000)
         except Exception as exc:
             logger.error(f"[{self.account.account_id}] Failed to load login page: {exc}")
+            return False
+
+        if await self._abort_if_captcha("login page"):
             return False
 
         try:
@@ -234,6 +260,9 @@ class GoOutScraper:
             await self._page.wait_for_timeout(5000)
         except Exception as exc:
             logger.error(f"[{self.account.account_id}] Login button click failed: {exc}")
+            return False
+
+        if await self._abort_if_captcha("post-submit"):
             return False
 
         needs_2fa = await self._check_for_2fa()

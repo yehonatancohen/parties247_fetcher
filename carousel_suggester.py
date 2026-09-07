@@ -11,6 +11,8 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
+from best_sellers import is_best_sellers_title
+
 # ---------------------------------------------------------------------------
 # Keyword maps: canonical keyword → list of surface forms to search for
 # ---------------------------------------------------------------------------
@@ -189,7 +191,7 @@ def suggest_carousels_for_party(party: dict, carousels: list) -> list[str]:
     for carousel in carousels:
         cid = str(carousel.get("id") or carousel.get("_id", ""))
         title = carousel.get("title") or ""
-        if _contains(title, ["חם עכשיו", "hot now"]):
+        if _contains(title, ["חם עכשיו", "hot now"]) or is_best_sellers_title(title):
             continue  # hot-now is account1-only, managed by run_hot_now_update
         matchers = _build_matchers(title)
         if not matchers:
@@ -228,7 +230,7 @@ def suggest_carousel_assignments(backend_url: str) -> dict:
         title = carousel.get("title") or ""
         current_ids = {str(pid) for pid in (carousel.get("partyIds") or [])}
 
-        if _contains(title, ["חם עכשיו", "hot now"]):
+        if _contains(title, ["חם עכשיו", "hot now"]) or is_best_sellers_title(title):
             # hot-now is account1-only, managed exclusively by run_hot_now_update
             results[cid] = {"title": title, "already_in": len(current_ids), "to_add": [], "hot_now": True}
             continue

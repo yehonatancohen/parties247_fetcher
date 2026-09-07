@@ -13,7 +13,7 @@ import pymongo
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import config
-from orchestrator import run_daily_scrape
+from orchestrator import run_daily_scrape, run_best_sellers_update
 from scraper import GoOutAccount
 from telegram_bot import TelegramManager
 from sales_tracker import run_sales_update
@@ -72,8 +72,13 @@ def main():
     # next_run_time=now forces the first run immediately instead of APScheduler's
     # default (start + interval) — without this, every redeploy/restart opens a
     # ~4h blind window before sales are checked again.
+    def _sales_job():
+        run_sales_update(accounts, db, telegram_mgr)
+        # Sales just changed, so the revenue-ranked carousel may have too.
+        run_best_sellers_update(accounts, db, telegram_mgr)
+
     scheduler.add_job(
-        func=lambda: run_sales_update(accounts, db, telegram_mgr),
+        func=_sales_job,
         trigger="interval",
         hours=4,
         id="sales_update",

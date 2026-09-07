@@ -22,6 +22,8 @@ from utils import normalize_url, normalized_or_none_for_dedupe, apply_default_re
 from scraper import GoOutScraper, GoOutAccount
 from carousel_suggester import suggest_carousel_assignments, suggest_carousels_for_party
 from dedupe_parties import run_dedupe
+from alerts import discovery_alert, previous_discovery_count, record_discovery_count
+from best_sellers import BEST_SELLERS_TITLE, is_best_sellers_title, rank_best_sellers
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +213,7 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
         loop.close()
 
     run_hot_now_update(accounts, db, telegram_mgr)
+    run_best_sellers_update(accounts, db, telegram_mgr)
     run_carousel_auto_assign(telegram_mgr)
     run_dedupe_pass(telegram_mgr)
 
@@ -334,6 +337,18 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
             event_entries = await scraper.discover_events()
             logger.info(f"[{account.account_id}] Discovered {len(event_entries)} event(s)")
+
+            # Silent-zero guard: GoOut's panel has no stable selectors, so a copy
+            # change can zero out discovery with no exception. Compare against the
+            # last healthy count and shout on Telegram if this run looks broken.
+            previous_count = previous_discovery_count(db, account.account_id)
+            anomaly = discovery_alert(account.account_id, len(event_entries), previous_count)
+            if anomaly and telegram_mgr:
+                telegram_mgr.send_message_sync(anomaly)
+            if event_entries:
+                # Only a non-zero count becomes the new baseline, so a dark
+                # account keeps alerting every day until it's actually fixed.
+                record_discovery_count(db, account.account_id, len(event_entries))
 
             for entry in event_entries:
                 event_url = entry.get("url", "")
@@ -577,6 +592,101 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
             chunk = f"{chunk}\n{line}" if chunk else line
     if chunk:
         _send_summary(chunk)
+
+
+def run_best_sellers_update(accounts: list[GoOutAccount], db, telegram_mgr):
+    """
+    Rebuild the revenue-weighted "best sellers" carousel as an exact full-replace:
+    upcoming parties ordered by the commission they earned us in the last 14 days
+    (see best_sellers.py). Creates the carousel on first run. Best-effort — never
+    raises into the scheduler.
+    """
+    if db is None:
+        logger.warning("[BEST-SELLERS] No db handle; skipping")
+        return
+    account1 = next((a for a in accounts if a.account_id == "account1"), None)
+
+    try:
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/carousels", timeout=10)
+        carousels = resp.json() if resp.status_code == 200 else []
+    except Exception as exc:
+        logger.error(f"[BEST-SELLERS] Failed to fetch carousels: {exc}")
+        return
+
+    carousel = next((c for c in carousels if is_best_sellers_title(c.get("title"))), None)
+    try:
+        headers = telegram_mgr._auth_headers() if telegram_mgr else {}
+    except Exception as exc:
+        logger.error(f"[BEST-SELLERS] Could not get admin JWT: {exc}")
+        return
+
+    if not carousel:
+        try:
+            resp = http_requests.post(
+                f"{config.BACKEND_URL}/api/admin/carousels",
+                json={"title": BEST_SELLERS_TITLE},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code not in (200, 201):
+                logger.error(f"[BEST-SELLERS] Failed to create carousel: {resp.status_code} {resp.text[:200]}")
+                return
+            carousel = resp.json()
+            logger.info(f"[BEST-SELLERS] Created carousel '{BEST_SELLERS_TITLE}'")
+        except Exception as exc:
+            logger.error(f"[BEST-SELLERS] Failed to create carousel: {exc}")
+            return
+
+    carousel_id = str(carousel.get("id") or carousel.get("_id", ""))
+    current_ids = [str(pid) for pid in (carousel.get("partyIds") or [])]
+
+    try:
+        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties?upcoming=true", timeout=30)
+        upcoming = resp.json() if resp.status_code == 200 else []
+    except Exception as exc:
+        logger.error(f"[BEST-SELLERS] Failed to fetch parties: {exc}")
+        return
+
+    now = datetime.now(timezone.utc)
+    try:
+        cutoff = now - timedelta(days=14)
+        log_rows = list(db.goout_sales_log.find(
+            {"recorded_at": {"$gte": cutoff}},
+            {"go_out_id": 1, "delta_confirmed": 1, "revenue_earned": 1, "recorded_at": 1},
+        ))
+    except Exception as exc:
+        logger.error(f"[BEST-SELLERS] Failed to read goout_sales_log: {exc}")
+        return
+
+    new_ids = rank_best_sellers(
+        upcoming, log_rows, now=now,
+        account1_referral=account1.referral if account1 else None,
+    )
+    if new_ids == current_ids:
+        logger.info(f"[BEST-SELLERS] Unchanged ({len(new_ids)} parties)")
+        return
+
+    try:
+        resp = http_requests.put(
+            f"{config.BACKEND_URL}/api/admin/carousels/{carousel_id}/parties",
+            json={"partyIds": new_ids},
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.error(f"[BEST-SELLERS] Failed to update carousel: {resp.status_code} {resp.text[:200]}")
+            return
+    except Exception as exc:
+        logger.error(f"[BEST-SELLERS] Failed to update carousel: {exc}")
+        return
+
+    added = len(set(new_ids) - set(current_ids))
+    removed = len(set(current_ids) - set(new_ids))
+    logger.info(f"[BEST-SELLERS] Updated: +{added} -{removed} ({len(new_ids)} total)")
+    if telegram_mgr:
+        telegram_mgr.send_message_sync(
+            f"🏆 *Best sellers* carousel synced: +{added} added, -{removed} removed ({len(new_ids)} total)."
+        )
 
 
 def run_carousel_auto_assign(telegram_mgr):

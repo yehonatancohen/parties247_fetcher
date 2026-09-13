@@ -159,6 +159,7 @@ def run_wa_sales_watch(db, telegram_mgr=None, *, http=requests, now: datetime | 
         return summary
 
     if not watchlist:
+        logger.info("wa_sales_watch: nothing on the backend's watchlist this tick.")
         return summary
 
     sales_by_event: dict[str, dict] = {}
@@ -173,6 +174,13 @@ def run_wa_sales_watch(db, telegram_mgr=None, *, http=requests, now: datetime | 
     events = select_watchlist_events(watchlist, sales_by_event)
     summary["watched"] = len(events)
     if not events:
+        # The backend flagged campaigns to watch, but none had a matching
+        # goout_sales doc with a mongo_id yet — normal for a party just
+        # queued moments ago, before the next 4h sales_update has scraped
+        # it at all. Worth distinguishing from "nothing on the watchlist"
+        # (above) if this ever shows up more than transiently.
+        logger.info(f"wa_sales_watch: {len(watchlist)} watchlist entr{'y' if len(watchlist) == 1 else 'ies'}, "
+                    "none resolvable to a known goout_sales doc yet.")
         return summary
 
     tokens_by_account: dict[str, str | None] = {}
@@ -220,6 +228,15 @@ def run_wa_sales_watch(db, telegram_mgr=None, *, http=requests, now: datetime | 
             logger.error(f"wa_sales_watch: failed to insert snapshot for {event['go_out_id']}: {exc}")
 
     trigger_facts_rebuild(backend_url=config.BACKEND_URL, service_token=config.SERVICE_TOKEN, http=http)
+    # A summary on every tick, not just failures — the only other signal
+    # this job ran at all was silence, which is indistinguishable from a
+    # stuck scheduler or a caught-but-unlogged exception (found while
+    # verifying the 2026-09-13 watchlist fix live: even a fully successful
+    # run left zero trace in the logs).
+    logger.info(
+        f"wa_sales_watch: watched={summary['watched']} snapshotted={summary['snapshotted']} "
+        f"skipped_backoff={summary['skipped_backoff']} failed={len(summary['failed'])}"
+    )
     return summary
 
 

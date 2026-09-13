@@ -306,6 +306,12 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     "ticket_price":    stored_price,
                     "event_revenue":   live_event_revenue,
                     "last_updated":    now,
+                    # GoOut's own Mongo _id for this event — already captured for
+                    # free from myEvents (see scraper.py::_extract_sales_from_obj)
+                    # and required by the endOne/* relay endpoints. Persisted here
+                    # so wa_sales_watch.py's targeted fast polling doesn't need a
+                    # separate lookup per watched event.
+                    "mongo_id":        item.get("mongo_id"),
                     # Real per-event data from www.go-out.co/endOne/* (via cf-relay) —
                     # separate from the fields above, which come from the myEvents API.
                     "views":              views,

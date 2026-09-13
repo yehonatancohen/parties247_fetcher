@@ -17,6 +17,7 @@ from orchestrator import run_daily_scrape, run_best_sellers_update
 from scraper import GoOutAccount
 from telegram_bot import TelegramManager
 from sales_tracker import run_sales_update
+from wa_sales_watch import run_wa_sales_watch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +77,8 @@ def main():
         run_sales_update(accounts, db, telegram_mgr)
         # Sales just changed, so the revenue-ranked carousel may have too.
         run_best_sellers_update(accounts, db, telegram_mgr)
+        # ...and so may the WhatsApp send-facts dataset for any campaigned party.
+        run_wa_sales_watch(db, telegram_mgr)
 
     scheduler.add_job(
         func=_sales_job,
@@ -85,10 +88,23 @@ def main():
         replace_existing=True,
         next_run_time=datetime.now(),
     )
+    # Targeted fast sales polling for parties a WhatsApp campaign just
+    # touched (queued or sent in the last 24h) — the 4h job above is too
+    # coarse to tell an 18:00 send from a 21:00 one apart. Browser-free:
+    # reuses each account's saved session token, never logs in, so it can
+    # never trigger 2FA. See wa_sales_watch.py.
+    scheduler.add_job(
+        func=lambda: run_wa_sales_watch(db, telegram_mgr),
+        trigger="interval",
+        minutes=20,
+        id="wa_sales_watch",
+        replace_existing=True,
+        next_run_time=datetime.now(),
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC, "
-        "sales update every 4 hours"
+        "sales update every 4 hours, wa sales watch every 20 minutes"
     )
 
     # Wire /scrape command to trigger a manual scan

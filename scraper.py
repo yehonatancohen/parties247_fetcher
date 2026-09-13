@@ -17,6 +17,7 @@ from typing import Any
 
 import config
 from alerts import captcha_message, detect_captcha, should_send_captcha_alert
+from endone_relay import ENDONE_STATS_ENDPOINTS
 
 logger = logging.getLogger(__name__)
 
@@ -872,19 +873,10 @@ class GoOutScraper:
         except Exception:
             return ""
 
-    # Endpoint -> (relay path, extra body fields beyond {"eventId": mongo_id})
-    _ENDONE_STATS_ENDPOINTS = {
-        "views":            ("getEventViews", {}),
-        "ticket_stats":     ("getUserTicketStatistics/", {}),
-        "revenue":          ("getEventStatistics/getRevenueData", {}),
-        "sales_per_date":   ("getEventStatistics/SalesPerDate", {}),
-        "leading_salesman": ("getXLeadingSalesman", {"numberOfUsers": 10}),
-        "last_accepted":    ("getXLastAcceptedUsers", {"numberOfUsers": 25}),
-        "expenses":         ("getTotalExpenses", {}),
-        "top_tickets":      ("getTopTickets", {}),
-        "last_day":         ("eventManagement/lastDayData", {}),
-        "financial_summary":("eventManagement/finnacialSummary", {}),
-    }
+    # Endpoint map (relay path, extra body fields beyond {"eventId": mongo_id}) —
+    # shared with wa_sales_watch.py's browser-free sync polling via endone_relay.py,
+    # so the two call sites can't drift apart.
+    _ENDONE_STATS_ENDPOINTS = ENDONE_STATS_ENDPOINTS
 
     async def _fetch_endone_stats(self, mongo_id: str, cookie_header: str, auth_header: str) -> dict:
         """Pull every known www.go-out.co/endOne/* stat for one event via the cf-relay

@@ -207,8 +207,6 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
         )
     except Exception as exc:
         logger.error(f"Daily scrape failed: {exc}")
-        if telegram_mgr:
-            telegram_mgr.send_message_sync(f"❌ Daily scrape error: {exc}")
     finally:
         loop.close()
 
@@ -230,15 +228,13 @@ def run_dedupe_pass(telegram_mgr):
     """
     try:
         result = run_dedupe(apply=True, log=logger.info)
-        if telegram_mgr and result.get("deleted"):
-            telegram_mgr.send_message_sync(
-                f"🧹 Dedup: merged {result['deleted']} duplicate part(y/ies) "
+        if result.get("deleted"):
+            logger.info(
+                f"Dedup: merged {result['deleted']} duplicate part(y/ies) "
                 f"across {result['groups']} group(s), redirected to survivors."
             )
     except Exception as exc:
         logger.error(f"Dedupe pass failed: {exc}")
-        if telegram_mgr:
-            telegram_mgr.send_message_sync(f"⚠️ Dedupe pass failed: {exc}")
 
 
 async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
@@ -329,10 +325,7 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
         try:
             session_ok = await scraper.ensure_session()
             if not session_ok:
-                if telegram_mgr:
-                    telegram_mgr.send_message_sync(
-                        f"⚠️ Could not log in to *{account.account_id}*. Skipping."
-                    )
+                logger.warning(f"[{account.account_id}] Could not log in. Skipping.")
                 return 0
 
             event_entries = await scraper.discover_events()
@@ -546,8 +539,6 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
             logger.info(f"[{account.account_id}] Auto-approved {len(added_lines)} new events")
         except Exception as exc:
             logger.error(f"[{account.account_id}] Scrape error: {exc}")
-            if telegram_mgr:
-                telegram_mgr.send_message_sync(f"❌ Error scraping *{account.account_id}*: {exc}")
         finally:
             await scraper.close()
         return added_lines
@@ -566,32 +557,37 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
     )
     if all_added:
         summary += "\n\n" + "\n".join(all_added)
+    logger.info(summary.replace("*", ""))
 
-    def _send_summary(text: str):
-        try:
-            http_requests.post(
-                f"https://api.telegram.org/bot{telegram_mgr.token}/sendMessage",
-                json={
-                    "chat_id": telegram_mgr.manager_chat_id,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-                timeout=10,
-            )
-        except Exception:
-            if telegram_mgr:
+    # Automated daily-scrape summaries are intentionally not sent to Telegram
+    # (too noisy — user only wants sold-ticket and 2FA notifications). A
+    # manually-triggered scan (force_send=True, e.g. `/scrape`) still reports
+    # back since that's an explicit, one-off request.
+    if force_send and telegram_mgr:
+        def _send_summary(text: str):
+            try:
+                http_requests.post(
+                    f"https://api.telegram.org/bot{telegram_mgr.token}/sendMessage",
+                    json={
+                        "chat_id": telegram_mgr.manager_chat_id,
+                        "text": text,
+                        "parse_mode": "Markdown",
+                    },
+                    timeout=10,
+                )
+            except Exception:
                 telegram_mgr.send_message_sync(text)
 
-    # Telegram caps messages at 4096 chars — split on line boundaries if needed
-    chunk = ""
-    for line in summary.split("\n"):
-        if chunk and len(chunk) + len(line) + 1 > 3900:
+        # Telegram caps messages at 4096 chars — split on line boundaries if needed
+        chunk = ""
+        for line in summary.split("\n"):
+            if chunk and len(chunk) + len(line) + 1 > 3900:
+                _send_summary(chunk)
+                chunk = line
+            else:
+                chunk = f"{chunk}\n{line}" if chunk else line
+        if chunk:
             _send_summary(chunk)
-            chunk = line
-        else:
-            chunk = f"{chunk}\n{line}" if chunk else line
-    if chunk:
-        _send_summary(chunk)
 
 
 def run_best_sellers_update(accounts: list[GoOutAccount], db, telegram_mgr):
@@ -740,8 +736,6 @@ def run_carousel_auto_assign(telegram_mgr):
             logger.error(f"[CAROUSEL-AUTO] Error updating '{info['title']}': {exc}")
 
     logger.info(f"[CAROUSEL-AUTO] Done. Total parties added across all carousels: {total_added}")
-    if total_added and telegram_mgr:
-        telegram_mgr.send_message_sync(f"🎠 *Carousel auto-assign*: {total_added} parties added across carousels.")
 
 
 def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
@@ -804,7 +798,3 @@ def run_hot_now_update(accounts: list[GoOutAccount], db, telegram_mgr):
     removed = len(current_ids) - len([p for p in current_ids if p in set(new_ids)])
     added = len([p for p in new_ids if p not in set(current_ids)])
     logger.info(f"[HOT-NOW] Hot Now updated: +{added} added, -{removed} removed ({len(new_ids)} total)")
-    if changed and telegram_mgr:
-        telegram_mgr.send_message_sync(
-            f"🔥 *Hot Now* synced: +{added} added, -{removed} removed ({len(new_ids)} total)."
-        )

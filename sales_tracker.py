@@ -73,8 +73,6 @@ def run_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=None):
         loop.run_until_complete(_async_sales_update(accounts, db, telegram_mgr))
     except Exception as exc:
         logger.error(f"Sales update failed: {exc}")
-        if telegram_mgr:
-            telegram_mgr.send_message_sync(f"❌ Sales update error: {exc}")
     finally:
         loop.close()
 
@@ -88,10 +86,6 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
     for account, result in zip(accounts, results):
         if isinstance(result, Exception):
             logger.error(f"[{account.account_id}] Sales update error: {result}")
-            if telegram_mgr:
-                telegram_mgr.send_message_sync(
-                    f"⚠️ Sales update failed for *{account.account_id}*: {result}"
-                )
         else:
             new_sales.extend(result or [])
 
@@ -168,15 +162,10 @@ def _reconcile_dual_account_referrals(accounts: list[GoOutAccount], db, telegram
             logger.info(f"[reconcile] Re-attributed '{party.get('name')}' to account1 referral.")
 
     if fixed:
-        try:
-            names = "\n".join(f"  • {n}" for n in fixed[:15])
-            more = f"\n  …and {len(fixed) - 15} more" if len(fixed) > 15 else ""
-            telegram_mgr.send_message_sync(
-                f"🔀 *Fixed referral attribution* — {len(fixed)} dual-tracked event(s) "
-                f"were showing account2's link, now on account1:\n{names}{more}"
-            )
-        except Exception as exc:
-            logger.error(f"Failed to send reconciliation summary to Telegram: {exc}")
+        logger.info(
+            f"[reconcile] Fixed referral attribution for {len(fixed)} dual-tracked "
+            f"event(s), now on account1: {', '.join(fixed)}"
+        )
 
 
 async def _update_account(account: GoOutAccount, db, telegram_mgr=None):

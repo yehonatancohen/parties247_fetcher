@@ -333,11 +333,12 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
             # Silent-zero guard: GoOut's panel has no stable selectors, so a copy
             # change can zero out discovery with no exception. Compare against the
-            # last healthy count and shout on Telegram if this run looks broken.
+            # last healthy count and log if this run looks broken (not sent to
+            # Telegram — only sold-ticket and 2FA notifications go there).
             previous_count = previous_discovery_count(db, account.account_id)
             anomaly = discovery_alert(account.account_id, len(event_entries), previous_count)
-            if anomaly and telegram_mgr:
-                telegram_mgr.send_message_sync(anomaly)
+            if anomaly:
+                logger.warning(anomaly.replace("*", "").replace("`", ""))
             if event_entries:
                 # Only a non-zero count becomes the new baseline, so a dark
                 # account keeps alerting every day until it's actually fixed.
@@ -679,10 +680,6 @@ def run_best_sellers_update(accounts: list[GoOutAccount], db, telegram_mgr):
     added = len(set(new_ids) - set(current_ids))
     removed = len(set(current_ids) - set(new_ids))
     logger.info(f"[BEST-SELLERS] Updated: +{added} -{removed} ({len(new_ids)} total)")
-    if telegram_mgr:
-        telegram_mgr.send_message_sync(
-            f"🏆 *Best sellers* carousel synced: +{added} added, -{removed} removed ({len(new_ids)} total)."
-        )
 
 
 def run_carousel_auto_assign(telegram_mgr):

@@ -211,10 +211,10 @@ def run_wa_sales_watch(db, telegram_mgr=None, *, http=requests, now: datetime | 
         )
         if not stats:
             _record_watch_failure(db, account_id, now)
-            if should_send_watch_alert(session_doc.get("wa_watch_last_alert_at"), now) and telegram_mgr is not None:
+            if should_send_watch_alert(session_doc.get("wa_watch_last_alert_at"), now):
                 _record_watch_alert(db, account_id, now)
-                telegram_mgr.send_message_sync(
-                    f"⚠️ *{account_id}*: WhatsApp sales-watch couldn't reach the endOne relay "
+                logger.warning(
+                    f"[{account_id}] WhatsApp sales-watch couldn't reach the endOne relay "
                     f"(checked while snapshotting a recently-promoted party). Backing off {BACKOFF_COOLDOWN}."
                 )
             summary["failed"].append(event["go_out_id"])

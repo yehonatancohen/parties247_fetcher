@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import config
-from alerts import captcha_message, detect_captcha, should_send_captcha_alert
+from alerts import detect_captcha
 from endone_relay import ENDONE_STATS_ENDPOINTS
 
 logger = logging.getLogger(__name__)
@@ -214,11 +214,6 @@ class GoOutScraper:
             return False
         logger.error(f"[{self.account.account_id}] Bot challenge detected ({marker}) at {stage}; aborting login.")
         self._mark_session_invalid()
-        if self._telegram and should_send_captcha_alert(self._db, self.account.account_id):
-            try:
-                self._telegram.send_message_sync(captcha_message(self.account.account_id, marker, stage))
-            except Exception as exc:
-                logger.warning(f"[{self.account.account_id}] Could not send CAPTCHA alert: {exc}")
         return True
 
     async def _perform_login(self) -> bool:

@@ -18,6 +18,7 @@ from scraper import GoOutAccount
 from telegram_bot import TelegramManager
 from sales_tracker import run_sales_update
 from wa_sales_watch import run_wa_sales_watch
+from fast_sales_alerts import run_fast_sales_alerts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,10 +102,21 @@ def main():
         replace_existing=True,
         next_run_time=datetime.now(),
     )
+    # Tell the manager about new confirmed tickets at a useful cadence, not
+    # only in the regular 4h accounting update. Browser-free and based on the
+    # saved GoOut sessions; first check runs 20m after startup so the immediate
+    # sales_update above can establish a baseline first.
+    scheduler.add_job(
+        func=lambda: run_fast_sales_alerts(db, telegram_mgr),
+        trigger="interval",
+        minutes=20,
+        id="fast_sales_alerts",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC, "
-        "sales update every 4 hours, wa sales watch every 20 minutes"
+        "sales update every 4 hours, wa sales watch and sale alerts every 20 minutes"
     )
 
     # Wire /scrape command to trigger a manual scan

@@ -282,13 +282,26 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                     f"revenue delta=₪{delta_event_revenue or 0:.2f} → "
                     f"earned ₪{rev:.2f}"
                 )
-                new_sales.append({
-                    "account_id":          account.account_id,
-                    "event_name":          event_name or go_out_id,
-                    "delta_confirmed":     delta_confirmed,
-                    "delta_event_revenue": delta_event_revenue,
-                    "revenue_earned":      rev,
+                # The 20-minute browser-free watcher may already have told the
+                # manager about these tickets. Keep the full delta above for
+                # accounting, but avoid repeating it in the 4h Telegram digest.
+                fast_state = db.goout_fast_sales_state.find_one({
+                    "account_id": account.account_id, "go_out_id": str(go_out_id)
                 })
+                already_alerted = int((fast_state or {}).get("last_alerted_count") or 0)
+                unalerted_delta = max(0, confirmed_now - max(prev_confirmed, already_alerted))
+                should_notify = (
+                    unalerted_delta > 0
+                    or (delta_confirmed == 0 and bool(delta_event_revenue and delta_event_revenue > 0))
+                )
+                if should_notify:
+                    new_sales.append({
+                        "account_id":          account.account_id,
+                        "event_name":          event_name or go_out_id,
+                        "delta_confirmed":     unalerted_delta if delta_confirmed > 0 else 0,
+                        "delta_event_revenue": delta_event_revenue,
+                        "revenue_earned":      rev,
+                    })
 
             # Upsert the latest snapshot
             sales_coll.update_one(

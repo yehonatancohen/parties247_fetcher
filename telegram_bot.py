@@ -722,15 +722,21 @@ class TelegramManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def send_message_sync(self, text: str, parse_mode: str = "Markdown"):
+    def send_message_sync(self, text: str, parse_mode: str | None = "Markdown"):
         try:
-            http_requests.post(
+            payload = {"chat_id": self.manager_chat_id, "text": text}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            response = http_requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.manager_chat_id, "text": text, "parse_mode": parse_mode},
+                json=payload,
                 timeout=10,
             )
+            response.raise_for_status()
+            return bool(response.json().get("ok"))
         except Exception as exc:
             logger.error(f"send_message_sync failed: {exc}")
+            return False
 
     async def _send_text(self, text: str, parse_mode: str = "Markdown"):
         try:

@@ -33,6 +33,7 @@ from telegram.ext import (
 
 import config
 from carousel_suggester import suggest_carousels_for_party
+from producers import get_producer_report
 from sales_tracker import get_sales_summary, get_monthly_report, get_available_months, get_lifetime_total
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class TelegramManager:
         self._app.add_handler(CommandHandler("sales", self._cmd_sales))
         self._app.add_handler(CommandHandler("sales_monthly", self._cmd_sales_monthly))
         self._app.add_handler(CommandHandler("sales_update", self._cmd_sales_update))
+        self._app.add_handler(CommandHandler("producers", self._cmd_producers))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
         self._app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -161,6 +163,7 @@ class TelegramManager:
             "/sales\\_monthly — This month's ticket sales\n"
             "/sales\\_monthly 2025\\-11 — Sales for a specific past month\n"
             "/sales\\_update — Trigger immediate sales scrape\n"
+            "/producers — Top producers by tickets we sold\n"
             "/cancel — Cancel current edit session\n"
             "/help — Show this message",
             parse_mode="Markdown",
@@ -354,6 +357,28 @@ class TelegramManager:
         if len(msg) > 4000:
             msg = msg[:4000] + "\n\\.\\.\\. \\(truncated\\)"
         await update.message.reply_text(msg, parse_mode="MarkdownV2")
+
+    async def _cmd_producers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Rank producers by tickets/commission we drove (leverage for deal negotiation)."""
+        if not self._is_manager(update):
+            return
+        if self._db is None:
+            await update.message.reply_text("⚠️ Database unavailable.")
+            return
+        try:
+            rep = await asyncio.to_thread(get_producer_report, self._db, 15)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Error: {exc}")
+            return
+        lines = ["🎤 *Top producers*\n"]
+        for i, r in enumerate(rep["rows"], 1):
+            lines.append(
+                f"{i}\\. {self._escape_md(r['producer'])} — {r['tickets']} tickets · "
+                f"{r['events']} events · ₪{r['revenue']:.0f}"
+            )
+        if rep["unknown_tickets"]:
+            lines.append(f"\n_{rep['unknown_tickets']} tickets with unknown producer_")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
     async def _cmd_sales_monthly(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show monthly revenue report. Optionally pass YYYY-MM as argument."""

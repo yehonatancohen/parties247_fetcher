@@ -98,6 +98,13 @@ async def _async_sales_update(accounts: list[GoOutAccount], db, telegram_mgr=Non
 
     _reconcile_dual_account_referrals(accounts, db, telegram_mgr)
 
+    # Best-effort producer attribution for newly added parties (see producers.py).
+    try:
+        from producers import ensure_producers
+        await asyncio.to_thread(ensure_producers, db, False, 0.4, 60)
+    except Exception as exc:
+        logger.warning(f"Producer attribution failed: {exc}")
+
 
 def _reconcile_dual_account_referrals(accounts: list[GoOutAccount], db, telegram_mgr=None):
     """

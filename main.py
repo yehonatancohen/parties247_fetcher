@@ -24,6 +24,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx logs full request URLs at INFO. Telegram Bot API puts the bot token in
+# its URL path, so logging those requests would disclose the token in container
+# logs. Keep application logs while suppressing request-URL logging.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

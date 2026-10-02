@@ -17,6 +17,7 @@ import requests
 
 import config
 from endone_relay import extract_token_from_storage_state, fetch_endone_stats_sync
+from sales_tracker import _calc_revenue
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,8 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
         if not isinstance(parties, list):
             raise ValueError("upcoming parties response was not a list")
         sales_docs = list(db.goout_sales.find(
-            {}, {"go_out_id": 1, "account_id": 1, "mongo_id": 1, "event_name": 1, "confirmed_count": 1}
+            {}, {"go_out_id": 1, "account_id": 1, "mongo_id": 1, "event_name": 1, "confirmed_count": 1,
+             "event_revenue": 1}
         ))
     except Exception as exc:
         logger.warning("fast_sales_alerts: couldn't load upcoming events: %s", exc)
@@ -98,7 +100,7 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
         stats = fetch_endone_stats_sync(
             event["mongo_id"], auth_header=f"Bearer {token}",
             relay_url=config.CF_RELAY_URL, relay_secret=config.CF_RELAY_SECRET,
-            fields=("ticket_stats",), session=http, retries=1,
+            fields=("ticket_stats", "revenue"), session=http, retries=1,
         )
         accepted = (stats.get("ticket_stats") or {}).get("Accepted")
         if accepted is None:
@@ -113,15 +115,35 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
             failed_accounts.add(account_id)
             continue
 
+        # Gross revenue GoOut reports for our share of the event (best effort:
+        # the ticket-count alert must still go out if this field is missing).
+        own_revenue = ((stats.get("revenue") or {}).get("revenue") or {}).get("own_revenue")
+        try:
+            own_revenue = float(own_revenue) if own_revenue is not None else None
+        except (TypeError, ValueError):
+            own_revenue = None
+
         state_key = {"account_id": account_id, "go_out_id": event["go_out_id"]}
         state = db.goout_fast_sales_state.find_one(state_key)
         if state:
             last_alerted = int(state.get("last_alerted_count") or 0)
+            last_revenue = state.get("last_alerted_revenue")
+            if last_revenue is None:
+                last_revenue = (sales_by_key.get((event["go_out_id"], account_id), {})
+                                .get("event_revenue"))
         else:
             baseline = sales_by_key.get((event["go_out_id"], account_id), {})
             last_alerted = int(baseline.get("confirmed_count") or 0)
+            last_revenue = baseline.get("event_revenue")
         if accepted > last_alerted:
-            pending_alerts.append({**event, "delta": accepted - last_alerted, "accepted": accepted})
+            delta = accepted - last_alerted
+            gross = None
+            if own_revenue is not None and last_revenue is not None:
+                gross = max(0.0, own_revenue - float(last_revenue))
+            commission = _calc_revenue(account_id, delta, gross, None)
+            pending_alerts.append({**event, "delta": delta, "accepted": accepted,
+                                   "gross": gross, "commission": commission,
+                                   "own_revenue": own_revenue})
 
         # Persist observed count, but keep last_alerted_count unchanged until a
         # Telegram send succeeds. A transient Telegram outage therefore retries
@@ -137,15 +159,26 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
     result["sales"] = sum(row["delta"] for row in pending_alerts)
     if pending_alerts and telegram_mgr:
         lines = ["🎟️ זוהו מכירות חדשות:"]
+        total_commission = 0.0
         for sale in pending_alerts:
-            lines.append(f"• {html.escape(str(sale['event_name']))}: +{sale['delta']} כרטיסים")
+            line = f"• {html.escape(str(sale['event_name']))}: +{sale['delta']} כרטיסים"
+            if sale["gross"] is not None:
+                line += f" | הכנסה ברוטו ₪{sale['gross']:,.0f}"
+            if sale["commission"]:
+                line += f" | העמלה שלנו ₪{sale['commission']:,.2f}"
+            total_commission += sale["commission"]
+            lines.append(line)
+        if total_commission:
+            lines.append(f"\n💰 סה״כ עמלה: ₪{total_commission:,.2f}")
         message = "\n".join(lines)
         sent = telegram_mgr.send_message_sync(message, parse_mode="HTML")
         if sent:
             for sale in pending_alerts:
                 db.goout_fast_sales_state.update_one(
                     {"account_id": sale["account_id"], "go_out_id": sale["go_out_id"]},
-                    {"$set": {"last_alerted_count": sale["accepted"], "last_alerted_at": now}},
+                    {"$set": {"last_alerted_count": sale["accepted"], "last_alerted_at": now,
+                              **({"last_alerted_revenue": sale["own_revenue"]}
+                                 if sale["own_revenue"] is not None else {})}},
                 )
         else:
             logger.warning("fast_sales_alerts: Telegram delivery failed; will retry next tick")

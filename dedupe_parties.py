@@ -282,7 +282,18 @@ def duplicate_reason(a: dict, b: dict) -> str | None:
     a_key = dedupe_key(a)
     b_key = dedupe_key(b)
     if a_key is not None and a_key == b_key:
-        return "same_name_day"
+        # Exact name+full-time is strong enough on its own. The older fuzzy
+        # brand-prefix+day rule is weaker, so require venue or image evidence
+        # before making a destructive merge.
+        if a_key[0] == "exact":
+            return "same_name_time"
+        same_image = bool(
+            a.get("imageUrl")
+            and b.get("imageUrl")
+            and a.get("imageUrl") == b.get("imageUrl")
+        )
+        if same_image or location_similarity(a.get("location"), b.get("location")) >= 0.55:
+            return "same_name_day"
 
     return None
 

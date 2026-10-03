@@ -193,7 +193,7 @@ def _parse_party_datetime(party: dict) -> datetime | None:
     return dt.astimezone(ISRAEL_TZ)
 
 
-def same_venue_time(a: dict, b: dict, max_minutes: int = 90) -> bool:
+def same_venue_time(a: dict, b: dict, max_minutes: int = 60) -> bool:
     """High-confidence same-event signal independent of title wording."""
     da = _parse_party_datetime(a)
     db = _parse_party_datetime(b)
@@ -208,10 +208,7 @@ def same_venue_time(a: dict, b: dict, max_minutes: int = 90) -> bool:
     if sim >= 0.88:
         return True
 
-    # Exact normalized venue/address can tolerate a little more start-time drift.
-    la = normalize_location(a.get("location"))
-    lb = normalize_location(b.get("location"))
-    return bool(la and la == lb and delta_minutes <= 120)
+    return False
 
 
 def brand_prefix(name: str) -> str:

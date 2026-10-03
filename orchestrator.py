@@ -218,21 +218,35 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
 
 def run_dedupe_pass(telegram_mgr):
     """
-    Auto-merge duplicate party listings (same name+date scraped as separate
-    GoOut events — confirmed to happen, e.g. "Revival Summer Festival
-    13-14.8" existed as 3 separate listings splitting real revenue/traffic
-    three ways, 2026-08-07). Runs every daily scrape now instead of staying
-    a manual one-shot script, so duplicates don't accumulate between runs.
-    Best-effort: any failure here must not affect the rest of the daily
-    scrape, which has already completed by this point.
+    Daily catalog-quality pass: auto-remove obvious test listings, merge only
+    high-confidence duplicates, and surface uncertain metadata for review.
+    Best-effort: a failure here must never break the scrape that already ran.
     """
     try:
         result = run_dedupe(apply=True, log=logger.info)
-        if result.get("deleted"):
+        deleted = int(result.get("deleted") or 0)
+        issues = result.get("issues") or []
+
+        if deleted:
             logger.info(
-                f"Dedup: merged {result['deleted']} duplicate part(y/ies) "
-                f"across {result['groups']} group(s), redirected to survivors."
+                f"Party quality: applied {deleted} cleanup action(s) "
+                f"across {result.get('groups', 0)} duplicate group(s)."
             )
+
+        # Do not spam on clean days. When intervention is useful, send one
+        # compact manager message with the first few review items.
+        if telegram_mgr and (deleted or issues):
+            lines = [
+                "Party quality scan",
+                f"Automatic cleanup: {deleted}",
+                f"Needs review: {len(issues)}",
+            ]
+            for issue in issues[:8]:
+                label = issue.get("name") or issue.get("slug") or issue.get("partyId") or "unknown"
+                lines.append(f"- {label}: {issue.get('message', issue.get('type', 'issue'))}")
+            if len(issues) > 8:
+                lines.append(f"- ...and {len(issues) - 8} more")
+            telegram_mgr.send_message_sync("\n".join(lines))
     except Exception as exc:
         logger.error(f"Dedupe pass failed: {exc}")
 

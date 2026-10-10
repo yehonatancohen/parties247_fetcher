@@ -60,7 +60,13 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
         return result
 
     try:
-        response = http.get(f"{config.BACKEND_URL}/api/parties?upcoming=true", timeout=20)
+        # includeHidden: a sale on a party we don't list (private on GoOut)
+        # is still a sale worth an alert.
+        response = http.get(
+            f"{config.BACKEND_URL}/api/parties?upcoming=true&includeHidden=1",
+            headers={"X-Service-Token": config.SERVICE_TOKEN},
+            timeout=20,
+        )
         response.raise_for_status()
         parties = response.json()
         if not isinstance(parties, list):

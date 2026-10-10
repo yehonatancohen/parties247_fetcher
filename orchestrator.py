@@ -9,9 +9,7 @@ Writes directly to MongoDB for:
 """
 
 import asyncio
-import json
 import logging
-import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
@@ -21,7 +19,7 @@ import config
 from utils import normalize_url, normalized_or_none_for_dedupe, apply_default_referral, slugify_party
 from scraper import GoOutScraper, GoOutAccount
 from carousel_suggester import suggest_carousel_assignments, suggest_carousels_for_party
-from dedupe_parties import run_dedupe
+from listing_sync import run_listing_audit
 from alerts import discovery_alert, previous_discovery_count, record_discovery_count
 from best_sellers import BEST_SELLERS_TITLE, is_best_sellers_title, rank_best_sellers
 
@@ -54,105 +52,6 @@ def _call_scrape_party(url: str) -> dict | None:
     except Exception as exc:
         logger.warning(f"[SCRAPER] Failed to call backend scrape-party for {url}: {exc}")
     return None
-
-
-def _scrape_event_page(url: str) -> dict | None:
-    """Fetch a public Go-Out event page and extract party details from __NEXT_DATA__."""
-    try:
-        resp = http_requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"_scrape_event_page: {resp.status_code} for {url}")
-            return None
-
-        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
-        if not m:
-            return None
-
-        data = json.loads(m.group(1))
-
-        def _find_evt(obj, depth=0):
-            if depth > 10:
-                return None
-            if isinstance(obj, dict):
-                if obj.get("EventSerial") and obj.get("StartingDate"):
-                    return obj
-                for v in obj.values():
-                    r = _find_evt(v, depth + 1)
-                    if r:
-                        return r
-            elif isinstance(obj, list):
-                for item in obj:
-                    r = _find_evt(item, depth + 1)
-                    if r:
-                        return r
-            return None
-
-        evt = _find_evt(data)
-        if not evt:
-            return None
-
-        date_raw = evt.get("StartingDate") or evt.get("startingDate") or ""
-        date_str = date_raw[:10] if date_raw else None
-
-        price = None
-        for ticket in (evt.get("Tickets") or []):
-            if ticket.get("Active", True):
-                t_price = ticket.get("Price")
-                if t_price and (price is None or t_price < price):
-                    price = t_price
-        if price is None:
-            price = evt.get("Price")
-
-        location = evt.get("Adress") or evt.get("EnglishAddress")
-
-        image_url = None
-        schema = evt.get("schemaOrg")
-        if isinstance(schema, list) and schema:
-            imgs = schema[0].get("image") or []
-            if imgs:
-                image_url = imgs[0]
-        if not image_url:
-            eid = evt.get("_id")
-            ts = evt.get("CoverImageTimestamp")
-            if eid and ts:
-                image_url = f"https://images.go-out.co/{eid}{ts}_coverImage.jpg"
-
-        result = {
-            "name": evt.get("Title") or evt.get("Name"),
-            "date": date_str,
-            "source": "go-out",
-        }
-        if price is not None:
-            result["ticketPrice"] = price
-        if location:
-            result["location"] = location
-        if image_url:
-            result["imageUrl"] = image_url
-        if evt.get("MusicType"):
-            result["musicType"] = evt["MusicType"]
-        if evt.get("EventType"):
-            result["eventType"] = evt["EventType"]
-        if evt.get("MinimumAge"):
-            result["age"] = str(evt["MinimumAge"])
-        if evt.get("Description"):
-            result["description"] = evt["Description"]
-        return result
-    except Exception as exc:
-        logger.warning(f"_scrape_event_page failed for {url}: {exc}")
-    return None
-
-
-def _name_similarity(a: str, b: str) -> float:
-    """Word-overlap ratio between two party names (0.0–1.0)."""
-    a_words = set(a.lower().split())
-    b_words = set(b.lower().split())
-    if not a_words or not b_words:
-        return 0.0
-    return len(a_words & b_words) / max(len(a_words), len(b_words))
 
 
 _TEST_INDICATORS = frozenset([
@@ -210,31 +109,14 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send:
     finally:
         loop.close()
 
+    # Listing Guard first: it brings every listing in line with GoOut, hides
+    # private events and merges duplicates, so the carousels below are rebuilt
+    # from the cleaned-up list. Everything it can't decide alone lands in the
+    # admin's Issues page (see listing_sync.py; rules live in the backend).
+    run_listing_audit(accounts, telegram_mgr)
     run_hot_now_update(accounts, db, telegram_mgr)
     run_best_sellers_update(accounts, db, telegram_mgr)
     run_carousel_auto_assign(telegram_mgr)
-    run_dedupe_pass(telegram_mgr)
-
-
-def run_dedupe_pass(telegram_mgr):
-    """
-    Auto-merge duplicate party listings (same name+date scraped as separate
-    GoOut events — confirmed to happen, e.g. "Revival Summer Festival
-    13-14.8" existed as 3 separate listings splitting real revenue/traffic
-    three ways, 2026-08-07). Runs every daily scrape now instead of staying
-    a manual one-shot script, so duplicates don't accumulate between runs.
-    Best-effort: any failure here must not affect the rest of the daily
-    scrape, which has already completed by this point.
-    """
-    try:
-        result = run_dedupe(apply=True, log=logger.info)
-        if result.get("deleted"):
-            logger.info(
-                f"Dedup: merged {result['deleted']} duplicate part(y/ies) "
-                f"across {result['groups']} group(s), redirected to survivors."
-            )
-    except Exception as exc:
-        logger.error(f"Dedupe pass failed: {exc}")
 
 
 async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, force_send: bool = False):
@@ -245,10 +127,15 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
     # Build a URL→party lookup from the backend once for the whole scrape run
     known_parties: dict[str, dict] = {}  # normalized_url -> {name, party_id, referralCode, url}
-    # (name, date YYYY-MM-DD, imageUrl, party_id, referralCode, url) for name+date duplicate detection
-    known_name_date: list[tuple[str, str, str, str, str, str]] = []
     try:
-        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
+        # includeHidden: parties the Listing Guard hid (private on GoOut) or
+        # merged into a duplicate still exist, and must still count as known —
+        # otherwise every one of them would be re-scraped and re-added daily.
+        resp = http_requests.get(
+            f"{config.BACKEND_URL}/api/parties?includeHidden=1",
+            headers={"X-Service-Token": config.SERVICE_TOKEN},
+            timeout=30,
+        )
         if resp.status_code == 200:
             for p in resp.json():
                 name = p.get("name", "")
@@ -262,10 +149,6 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                             "name": name, "party_id": pid, "referralCode": ref, "url": u,
                         }
                         party_url = party_url or u
-                date = (p.get("date") or "")[:10]
-                image = p.get("imageUrl") or p.get("image") or ""
-                if name and date:
-                    known_name_date.append((name, date, image, pid, ref, party_url))
             logger.info(f"Loaded {len(known_parties)} known party URLs from backend")
     except Exception as exc:
         logger.warning(f"Could not prefetch parties list: {exc}")
@@ -273,46 +156,6 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
     def _party_exists(canonical: str) -> dict | None:
         """Return the known party dict if already in DB, else None."""
         return known_parties.get(canonical)
-
-    def _find_duplicate(name: str, date: str) -> dict | None:
-        """Check for same-event different-account duplicates by name+date similarity."""
-        if not name or not date:
-            return None
-        party_date = date[:10]
-
-        # Check approved parties from backend
-        for k_name, k_date, k_image, k_id, k_ref, k_url in known_name_date:
-            if k_date != party_date:
-                continue
-            if name.lower() == k_name.lower():
-                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": True,
-                        "party_id": k_id, "referralCode": k_ref, "url": k_url}
-            if _name_similarity(name, k_name) >= 0.6:
-                return {"name": k_name, "imageUrl": k_image, "source": "approved", "exact": False,
-                        "party_id": k_id, "referralCode": k_ref, "url": k_url}
-
-        # Check parties already queued in this run
-        if pending_coll is not None:
-            try:
-                for doc in pending_coll.find(
-                    {"party_data.date": {"$regex": f"^{party_date}"}},
-                    {"party_data.name": 1, "party_data.imageUrl": 1, "party_db_id": 1},
-                ):
-                    pd = doc.get("party_data", {})
-                    p_name = pd.get("name", "")
-                    if not p_name:
-                        continue
-                    p_id = str(doc.get("party_db_id") or "")
-                    if p_name.lower() == name.lower():
-                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending",
-                                "exact": True, "party_id": p_id, "referralCode": None, "url": None}
-                    if _name_similarity(name, p_name) >= 0.6:
-                        return {"name": p_name, "imageUrl": pd.get("imageUrl", ""), "source": "pending",
-                                "exact": False, "party_id": p_id, "referralCode": None, "url": None}
-            except Exception as exc:
-                logger.warning(f"Duplicate pending check failed: {exc}")
-
-        return None
 
     def _reattribute_to_account1(party_id: str, base_url: str, account1: GoOutAccount) -> bool:
         return reattribute_party_to_account1(
@@ -391,26 +234,15 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     except Exception as exc:
                         logger.warning(f"[{account.account_id}] Pending dedup check failed: {exc}")
 
-                # Try to scrape full event details via backend, then direct page scrape
+                # Full event details come from the backend's one parser. If it
+                # can't read the event right now, skip it — tomorrow's run sees
+                # it again. (The old fallbacks here invented a listing from a
+                # second parser or from bare panel metadata, with a wrong price
+                # and "Unknown Location".)
                 party_data = _call_scrape_party(event_url)
-
                 if not party_data:
-                    party_data = _scrape_event_page(event_url)
-                    if party_data:
-                        party_data["goOutUrl"] = canonical
-                        party_data["canonicalUrl"] = canonical
-                        logger.info(f"[{account.account_id}] Used direct page scrape for {event_url}")
-
-                if not party_data:
-                    logger.info(f"Using discovery metadata for {event_url}")
-                    party_data = {
-                        "name": entry.get("name") or "Unknown Event",
-                        "goOutUrl": canonical,
-                        "canonicalUrl": canonical,
-                        "date": entry.get("date") or datetime.now().strftime("%Y-%m-%d"),
-                        "image": entry.get("image") or "",
-                        "source": "go-out",
-                    }
+                    logger.info(f"[{account.account_id}] Could not read {event_url} yet, will retry next run")
+                    continue
 
                 # Second filter: skip test events found in full scraped name
                 if _is_test_event(party_data.get("name", "")):
@@ -423,32 +255,12 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     "slug", slugify_party(party_data.get("name"), party_data.get("date"))
                 )
 
-                dup = _find_duplicate(party_data.get("name", ""), party_data.get("date", ""))
-                if dup and dup.get("exact"):
-                    logger.info(
-                        f"[{account.account_id}] Skipping exact duplicate: "
-                        f"'{party_data.get('name')}' == '{dup['name']}' ({dup['source']})"
-                    )
-                    # Same event on both accounts: account1 is the priority account,
-                    # so re-attribute the existing party to it (referral + hot-now).
-                    if (
-                        account.account_id == "account1"
-                        and dup.get("source") == "approved"
-                        and dup.get("referralCode") != account.referral
-                        and dup.get("party_id") and dup.get("url")
-                    ):
-                        if _reattribute_to_account1(dup["party_id"], dup["url"], account):
-                            logger.info(
-                                f"[account1] Re-attributed '{dup['name']}' to account1 referral."
-                            )
-                    known_parties[canonical] = dup["name"]  # avoid re-checking in same run
-                    continue
-                if dup:
-                    party_data["possible_duplicate"] = dup
-                    logger.info(
-                        f"[{account.account_id}] Possible duplicate: "
-                        f"'{party_data.get('name')}' ~ '{dup['name']}' ({dup['source']})"
-                    )
+                # No duplicate guessing here any more: the same real event listed
+                # twice is found by the Listing Guard audit that runs right after
+                # this scrape (account1 kept automatically, the rest asked once).
+                # Private GoOut events are still stored — their sales still earn
+                # commission — but the backend creates them hidden.
+                is_hidden = party_data.get("listingStatus") == "hidden"
 
                 # Auto-approve: call backend directly without human review
                 try:
@@ -492,7 +304,7 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
 
                     # Auto-assign to matching carousels
                     applied_carousel_titles: list[str] = []
-                    if party_db_id and telegram_mgr:
+                    if party_db_id and telegram_mgr and not is_hidden:
                         carousels = telegram_mgr._get_all_carousels()
                         suggested_ids = suggest_carousels_for_party(party_data, carousels)
                         for cid in suggested_ids:
@@ -523,14 +335,18 @@ async def _async_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, fo
                     # Collect for the end-of-run summary message
                     name_str = party_data.get("name") or "?"
                     date_str = (party_data.get("date") or "?")[:10]
-                    dup_flag = " ⚠️ possible dup" if dup else ""
+                    hidden_flag = " 🔒 private, not listed" if is_hidden else ""
                     carousel_str = (", ".join(applied_carousel_titles)
                                     if applied_carousel_titles else "none")
                     added_lines.append(
-                        f"• *{name_str}* — 📅 {date_str}{dup_flag} — 🎠 {carousel_str}"
+                        f"• *{name_str}* — 📅 {date_str}{hidden_flag} — 🎠 {carousel_str}"
                     )
 
-                    known_parties[canonical] = name_str  # prevent re-adding in same run
+                    # prevent re-adding in same run (the other account may list it too)
+                    known_parties[canonical] = {
+                        "name": name_str, "party_id": party_db_id,
+                        "referralCode": account.referral, "url": clean_url,
+                    }
 
                 except Exception as exc:
                     logger.error(f"[{account.account_id}] Auto-approve error for {canonical}: {exc}")

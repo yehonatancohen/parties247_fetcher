@@ -27,9 +27,29 @@ Both are also triggerable manually from Telegram (`/scrape [account_id]`, `/sale
 The maintenance scripts (`backfill_goout_event_id.py`, `cleanup_hot_now.py`) are **manual
 one-shot CLI tools only** — not scheduled, not wired to the bot. Run by hand with
 `python <script>.py [--apply]` (dry-run by default except `cleanup_hot_now.py`, which prompts
-interactively instead — not safe for unattended use). `dedupe_parties.py` is the exception as
-of 2026-08-07 — see "Fixed 2026-08-07 (sixth pass)" below, it's now also wired into the daily
-scrape via `orchestrator.py::run_dedupe_pass`, though it can still be run standalone too.
+interactively instead — not safe for unattended use). `dedupe_parties.py` no longer exists:
+duplicates are handled by the Listing Guard (next section).
+
+## Listing Guard courier (`listing_sync.py`, 2026-10-09)
+
+Every rule about what a listing says lives in the **backend** (`listings.py`; see workspace
+root `CLAUDE.md`). This service only fetches and forwards, browser-free (no GoOut login,
+so it can never trigger 2FA):
+
+- `listing_sync_tiers` — every 30 min: real ticket tiers per upcoming party from
+  `www.go-out.co/endOne/loadEventTickets` → `POST /api/internal/listings/sync`.
+- `listing_sync_full` — every 6 h: event page (`__NEXT_DATA__`, trimmed to `_EVENT_KEYS`)
+  + tiers. Also triggered by the admin's "Sync everything" button (`fullRequested`).
+- `run_listing_audit` — end of the daily scrape, before the carousel rebuilds: full sync,
+  fetch every live `/event/<slug>` on the public site (1 req/s), `POST
+  /api/internal/listings/audit`, then one Telegram line if issues are waiting.
+- Manual: `python listing_sync.py [--full] [--audit] [--apply]` (dry run by default).
+
+Discovery no longer guesses duplicates and has no fallback parsers: unknown URL →
+backend `scrape-party` → `add-party` → referral → carousels. A private GoOut event is still
+added (its sales still earn) but comes back `listingStatus: hidden` and skips carousels.
+Reads that must see hidden/merged parties use `/api/parties?includeHidden=1` with the
+service token (discovery index, referral reconcile, fast sales alerts).
 
 ## Daily scrape flow (`orchestrator.py::run_daily_scrape`)
 
@@ -47,8 +67,8 @@ scrape via `orchestrator.py::run_dedupe_pass`, though it can still be run standa
       account since it's the priority account) → skip if already sitting undecided in
       `goout_pending` (prevents re-notifying daily) → fetch full details via
       `POST /api/internal/scrape-party` (backend does the real scrape), falling back to a
-      direct public-page `__NEXT_DATA__` scrape, falling back to bare discovery metadata → fuzzy
-      duplicate check (word-overlap ≥0.6, flags but doesn't block) → auto-approve via
+      nothing — an unreadable event is retried next run (the old direct-scrape / bare-metadata
+      fallbacks and the fuzzy duplicate check were removed 2026-10-09) → auto-approve via
       `POST /api/admin/add-party`, apply referral code, auto-assign matching carousels
       (`carousel_suggester`), log an audit doc into `goout_pending` with
       `status: "auto_approved"`. `await asyncio.sleep(2)` between events (only throttling that
@@ -57,7 +77,8 @@ scrape via `orchestrator.py::run_dedupe_pass`, though it can still be run standa
       failure, so the next run doesn't need to log in again.
 4. Telegram summary message (raw HTTP to Bot API, not via the bot's own loop — this runs from a
    scheduler thread), chunked to Telegram's 4096-char limit.
-5. **Always** runs afterward, even if the scrape itself raised: `run_hot_now_update` (rebuilds
+5. **Always** runs afterward, even if the scrape itself raised: `run_listing_audit` (Listing
+   Guard, above), then `run_hot_now_update` (rebuilds
    the "חם עכשיו" carousel as an exact full-replace = account1's current upcoming parties) then
    `run_carousel_auto_assign` (keyword-based bulk carousel matching across *all* upcoming
    parties, not just newly scraped ones).
@@ -210,6 +231,12 @@ Ranked roughly by how much they'd affect reliability or data accuracy:
    copy-pasted from another service's `.env`.
 
 ## Fixed 2026-08-07 (sixth pass — duplicate GoOut listings fragmenting revenue/SEO)
+
+> Superseded 2026-10-09: `dedupe_parties.py` and `run_dedupe_pass` described below were
+> removed. It matched on our *stored* party name, which goes stale (13 of 103 names on the
+> day it was replaced), so it reported 0 duplicates while 4 real ones were live — and it
+> hard-deleted without asking. The Listing Guard merges reversibly instead. The
+> `party_redirects` mechanism introduced here is still what a merge uses.
 
 Found while running `/seo-update` with its new revenue-optimization scope: the same
 real-world event sometimes gets scraped as **multiple separate GoOut listings** (different

@@ -19,6 +19,7 @@ from telegram_bot import TelegramManager
 from sales_tracker import run_sales_update
 from wa_sales_watch import run_wa_sales_watch
 from fast_sales_alerts import run_fast_sales_alerts
+from listing_sync import run_listing_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,10 +118,31 @@ def main():
         id="fast_sales_alerts",
         replace_existing=True,
     )
+    # Listing Guard: keep every listing's price in line with GoOut's real
+    # ticket tiers every 30 minutes, and name/date/location/image every 6
+    # hours. Replaces the backend's own price_scan/content_refresh crons. The
+    # daily duplicate/issue audit runs at the end of the daily scrape (see
+    # orchestrator.run_daily_scrape). Browser-free, never logs in to GoOut.
+    scheduler.add_job(
+        func=lambda: run_listing_sync(full=False),
+        trigger="interval",
+        minutes=30,
+        id="listing_sync_tiers",
+        replace_existing=True,
+        next_run_time=datetime.now(),
+    )
+    scheduler.add_job(
+        func=lambda: run_listing_sync(full=True),
+        trigger="interval",
+        hours=6,
+        id="listing_sync_full",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started — daily scrape at {config.GOOUT_SCRAPE_HOUR:02d}:00 UTC, "
-        "sales update every 4 hours, wa sales watch and sale alerts every 20 minutes"
+        "sales update every 4 hours, wa sales watch and sale alerts every 20 minutes, "
+        "listing sync every 30 minutes"
     )
 
     # Wire /scrape command to trigger a manual scan

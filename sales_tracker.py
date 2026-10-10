@@ -144,7 +144,13 @@ def _reconcile_dual_account_referrals(accounts: list[GoOutAccount], db, telegram
         return
 
     try:
-        resp = http_requests.get(f"{config.BACKEND_URL}/api/parties", timeout=15)
+        # includeHidden: an unlisted (private/merged) party still earns, so its
+        # referral still has to point at account1.
+        resp = http_requests.get(
+            f"{config.BACKEND_URL}/api/parties?includeHidden=1",
+            headers={"X-Service-Token": config.SERVICE_TOKEN},
+            timeout=30,
+        )
         resp.raise_for_status()
         parties = resp.json()
     except Exception as exc:

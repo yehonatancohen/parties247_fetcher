@@ -17,7 +17,7 @@ ADMIN_PASSWORD: str = os.environ["ADMIN_PASSWORD"]
 SERVICE_TOKEN: str = os.environ["SERVICE_TOKEN"]
 
 # MongoDB database name (required when URI has no default db in the path)
-MONGODB_DB_NAME: str = os.environ.get("MONGODB_DB_NAME", "parties247")
+MONGODB_DB_NAME: str = os.environ.get("MONGODB_DB_NAME", "party247")
 
 # Go-Out account credentials
 GOOUT_ACCOUNTS: list[dict] = []

@@ -5,6 +5,11 @@ every four hours. This watcher polls only the authenticated organizer's
 Accepted ticket count for upcoming site events every 20 minutes, then sends
 one grouped Telegram message when counts rise. It uses the existing cf-relay
 and saved GoOut JWT; it does not log in or invoke an undocumented public API.
+
+New tickets are also written to `goout_sales_log` right away (and the
+`goout_sales` snapshot is moved up to match), so the admin shows a sale when
+the Telegram alert arrives instead of after the next 4-hour tracker run. The
+tracker then diffs against the moved snapshot, so nothing is counted twice.
 """
 
 from __future__ import annotations
@@ -51,11 +56,72 @@ def select_upcoming_events(parties: list[dict], sales_docs: list[dict]) -> list[
     return list(events.values())
 
 
+def record_fast_sale(db, snapshot: dict | None, account_id: str, accepted: int,
+                     own_revenue: float | None, now: datetime) -> dict | None:
+    """Log tickets the 4h tracker hasn't recorded yet and advance its snapshot.
+
+    `snapshot` is the event's goout_sales doc. Only the part of `accepted` above
+    the snapshot's confirmed_count is logged. The snapshot is advanced with a
+    compare-and-set on confirmed_count, so if the 4h tracker wrote in between,
+    nothing is logged here and the next tick compares against its value.
+    Returns the inserted log row, or None when there was nothing to record.
+    """
+    if not snapshot or snapshot.get("_id") is None:
+        return None
+    prev_confirmed = int(snapshot.get("confirmed_count") or 0)
+    if accepted <= prev_confirmed:
+        return None
+    delta = accepted - prev_confirmed
+
+    # Same revenue rule as sales_tracker: own_revenue is a cumulative counter,
+    # diffed against the snapshot. With no previous value the tracker logs the
+    # first lump itself, so the snapshot's revenue is left alone here.
+    prev_revenue = snapshot.get("event_revenue")
+    delta_revenue = None
+    if own_revenue is not None and prev_revenue is not None:
+        delta_revenue = own_revenue - float(prev_revenue)
+
+    update = {"confirmed_count": accepted, "last_updated": now}
+    if delta_revenue is not None and delta_revenue > 0:
+        update["event_revenue"] = own_revenue
+    claimed = db.goout_sales.update_one(
+        {"_id": snapshot["_id"], "confirmed_count": snapshot.get("confirmed_count")},
+        {"$set": update},
+    )
+    if not claimed.modified_count:
+        return None
+
+    ticket_price = snapshot.get("ticket_price")
+    row = {
+        "account_id": account_id,
+        "go_out_id": snapshot.get("go_out_id"),
+        "event_name": snapshot.get("event_name") or "",
+        "delta_confirmed": delta,
+        "delta_event_revenue": delta_revenue,
+        "ticket_price": ticket_price,
+        "revenue_earned": _calc_revenue(account_id, delta, delta_revenue, ticket_price),
+        "recorded_at": now,
+        "year_month": now.strftime("%Y-%m"),
+        "source": "fast_sales_alerts",
+    }
+    try:
+        db.goout_sales_log.insert_one(row)
+    except Exception:
+        # Put the snapshot back so the 4h tracker still logs these tickets.
+        db.goout_sales.update_one(
+            {"_id": snapshot["_id"], "confirmed_count": accepted},
+            {"$set": {"confirmed_count": snapshot.get("confirmed_count"),
+                      "event_revenue": prev_revenue}},
+        )
+        raise
+    return row
+
+
 def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
                           now: datetime | None = None) -> dict:
     """Poll upcoming parties and notify once, in aggregate, for count increases."""
     now = now or datetime.now(timezone.utc)
-    result = {"checked": 0, "sales": 0, "failed": 0}
+    result = {"checked": 0, "sales": 0, "failed": 0, "recorded": 0}
     if db is None or not (config.CF_RELAY_URL and config.CF_RELAY_SECRET):
         return result
 
@@ -73,7 +139,7 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
             raise ValueError("upcoming parties response was not a list")
         sales_docs = list(db.goout_sales.find(
             {}, {"go_out_id": 1, "account_id": 1, "mongo_id": 1, "event_name": 1, "confirmed_count": 1,
-             "event_revenue": 1}
+             "event_revenue": 1, "ticket_price": 1}
         ))
     except Exception as exc:
         logger.warning("fast_sales_alerts: couldn't load upcoming events: %s", exc)
@@ -151,6 +217,14 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
                                    "gross": gross, "commission": commission,
                                    "own_revenue": own_revenue})
 
+        # Record the sale now, independent of the Telegram message below.
+        try:
+            if record_fast_sale(db, sales_by_key.get((event["go_out_id"], account_id)),
+                                account_id, accepted, own_revenue, now):
+                result["recorded"] += 1
+        except Exception as exc:
+            logger.warning("fast_sales_alerts: couldn't record sale for %s: %s", event["go_out_id"], exc)
+
         # Persist observed count, but keep last_alerted_count unchanged until a
         # Telegram send succeeds. A transient Telegram outage therefore retries
         # the same grouped alert on the next poll rather than losing it.
@@ -189,6 +263,6 @@ def run_fast_sales_alerts(db, telegram_mgr=None, *, http=requests,
         else:
             logger.warning("fast_sales_alerts: Telegram delivery failed; will retry next tick")
 
-    logger.info("fast_sales_alerts: checked=%d new_tickets=%d failed=%d",
-                result["checked"], result["sales"], result["failed"])
+    logger.info("fast_sales_alerts: checked=%d new_tickets=%d recorded=%d failed=%d",
+                result["checked"], result["sales"], result["recorded"], result["failed"])
     return result

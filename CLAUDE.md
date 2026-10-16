@@ -8,6 +8,12 @@ relay, manual approve/reject, carousel management, sales reporting).
 
 Not on Vercel/Render — this is the one service that lives entirely on the VPS in Docker.
 
+**Sales reach the admin within ~20 min:** `fast_sales_alerts.py` (every 20 min) writes the
+new tickets to `goout_sales_log` (`source: "fast_sales_alerts"`) and moves the
+`goout_sales` snapshot up with a compare-and-set, so the 4h tracker diffs against it and
+nothing is counted twice. Before 2026-10-16 it only sent the Telegram alert and the admin
+waited for the 4h run.
+
 ## Entry point & scheduling
 
 `main.py` wires everything and blocks on `telegram_mgr.run_polling()` (main thread). An

@@ -227,6 +227,23 @@ async def _update_account(account: GoOutAccount, db, telegram_mgr=None):
                 {"account_id": account.account_id, "go_out_id": go_out_id}
             )
 
+            # A run with a dead token (GoOut answers 401, then the endOne stats come
+            # back empty) has no revenue for any event. Writing that None into the
+            # snapshot made the next good run re-book every event's whole lifetime
+            # revenue as new (2026-10-29). Keep the last known values instead.
+            if existing:
+                if live_event_revenue is None:
+                    live_event_revenue = existing.get("event_revenue")
+                if views is None:
+                    views = existing.get("views")
+                if not real_revenue:
+                    real_revenue = {
+                        "total_revenue": existing.get("real_total_revenue"),
+                        "own_revenue":   existing.get("real_own_revenue"),
+                    }
+                if not endone_stats:
+                    endone_stats = existing.get("endone_stats") or {}
+
             if existing:
                 prev_confirmed      = existing.get("confirmed_count", 0)
                 prev_event_revenue  = existing.get("event_revenue")

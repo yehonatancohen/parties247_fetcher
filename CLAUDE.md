@@ -169,6 +169,11 @@ edit-session, text is parsed as a JSON party-field-overrides object.
 - **account1**: flat ₪25 per new confirmed ticket (`ACCOUNT1_FLAT_FEE`).
 - **account2**: 6% of gross event revenue delta (`ACCOUNT2_PCT`), falling back to
   `delta_confirmed × ticket_price × 6%` when gross revenue isn't exposed to that account's role.
+- **A run with no stats keeps the snapshot's last known revenue** (fixed 2026-10-29). A
+  dead GoOut token (401s mid-run) makes every endOne lookup come back empty; writing that
+  `None` into `goout_sales.event_revenue` made the next good run treat every event as
+  "first sight" and re-book its whole lifetime revenue (17 account2 events, 10-29 08:05).
+  `fix_double_revenue.py` corrected the rows already written.
 - Dispatch is by substring match on `account_id` (`"account1" in account_id`) — **hardcoded to
   exactly these two accounts**. A third account would silently earn ₪0.
 - **First-time revenue-delta bug risk**: when `event_revenue` is seen for an event for the first

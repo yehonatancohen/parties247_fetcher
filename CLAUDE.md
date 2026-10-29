@@ -166,7 +166,9 @@ edit-session, text is parsed as a JSON party-field-overrides object.
 
 ## Sales/revenue rules (`sales_tracker.py`)
 
-- **account1**: flat ₪25 per new confirmed ticket (`ACCOUNT1_FLAT_FEE`).
+- **account1**: flat ₪15 per new confirmed ticket (`ACCOUNT1_FLAT_FEE`). It was ₪25 until the
+  owner moved it to ₪15 for every sale from 2026-10-01 on; the October log rows were
+  recomputed (`fee_change` on each row keeps the old value).
 - **account2**: 6% of gross event revenue delta (`ACCOUNT2_PCT`), falling back to
   `delta_confirmed × ticket_price × 6%` when gross revenue isn't exposed to that account's role.
 - **A run with no stats keeps the snapshot's last known revenue** (fixed 2026-10-29). A

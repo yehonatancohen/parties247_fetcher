@@ -57,7 +57,7 @@ def test_record_fast_sale_logs_new_tickets_and_advances_snapshot():
     db = _db([_snapshot()])
     row = fast_sales_alerts.record_fast_sale(db, _snapshot(), "account1", 6, 600.0, NOW)
     assert row["delta_confirmed"] == 2
-    assert row["revenue_earned"] == 50.0  # account1: ₪25 per ticket
+    assert row["revenue_earned"] == 30.0  # account1: ₪15 per ticket
     assert row["recorded_at"] == NOW and row["year_month"] == "2026-10"
     assert db.goout_sales_log.docs == [row]
     assert db.goout_sales.docs[0]["confirmed_count"] == 6

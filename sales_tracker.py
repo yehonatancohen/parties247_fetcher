@@ -25,7 +25,7 @@ from orchestrator import reattribute_party_to_account1
 
 logger = logging.getLogger(__name__)
 
-ACCOUNT1_FLAT_FEE = 25.0   # ₪ per confirmed ticket
+ACCOUNT1_FLAT_FEE = 15.0   # ₪ per confirmed ticket (was ₪25 until 2026-10; October onward is ₪15)
 ACCOUNT2_PCT      = 0.06   # 6 % of gross event revenue
 
 
